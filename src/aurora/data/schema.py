@@ -1,8 +1,7 @@
-﻿from datetime import datetime
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
-
 
 QualityFlag = Literal["ok", "missing", "estimated", "linked_workbook_unresolved"]
 

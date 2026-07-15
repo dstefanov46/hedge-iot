@@ -1,7 +1,7 @@
-﻿from dataclasses import dataclass
+import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
-import re
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -78,7 +78,9 @@ def hirvensalmi_records_to_frame(records: tuple[ProductionObservation, ...]) -> 
     return frame.sort_values(["site_id", "timestamp_utc"]).reset_index(drop=True)
 
 
-def _parse_sheet(sheet, source: str, site_id: str, timezone: ZoneInfo) -> list[ProductionObservation]:
+def _parse_sheet(
+    sheet, source: str, site_id: str, timezone: ZoneInfo
+) -> list[ProductionObservation]:
     quarter, year = _parse_quarter_sheet_name(sheet.title)
     start_row = 3 if quarter == 1 else 4
     fallback_start = datetime(year, (quarter - 1) * 3 + 1, 1, tzinfo=timezone)

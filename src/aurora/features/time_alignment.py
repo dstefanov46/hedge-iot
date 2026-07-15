@@ -1,7 +1,9 @@
 import pandas as pd
 
 
-def enforce_frequency(frame: pd.DataFrame, timestamp_column: str, frequency: str = "15min") -> pd.DataFrame:
+def enforce_frequency(
+    frame: pd.DataFrame, timestamp_column: str, frequency: str = "15min"
+) -> pd.DataFrame:
     """Return a time-indexed frame with a regular timestamp frequency."""
     if timestamp_column not in frame.columns:
         raise KeyError(f"Missing timestamp column: {timestamp_column}")

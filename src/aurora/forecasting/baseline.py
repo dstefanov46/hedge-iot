@@ -21,5 +21,9 @@ class PersistenceForecaster:
         if horizon_steps <= 0:
             raise ValueError("horizon_steps must be positive.")
 
-        index = frame.index[:horizon_steps] if len(frame.index) >= horizon_steps else range(horizon_steps)
+        index = (
+            frame.index[:horizon_steps]
+            if len(frame.index) >= horizon_steps
+            else range(horizon_steps)
+        )
         return pd.DataFrame({"forecast": [self._last_value] * horizon_steps}, index=index)
