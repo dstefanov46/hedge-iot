@@ -19,6 +19,7 @@ outputs/*
 !outputs/.gitkeep
 models/*
 !models/.gitkeep
+lightning_logs/
 
 # Keep source reference artifacts at repo root unless moved intentionally.
 ~$*.docx
