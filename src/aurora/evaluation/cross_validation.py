@@ -71,3 +71,33 @@ def generate_rolling_cv_folds(
         current_start = current_start + pd.DateOffset(months=1)
 
     return folds
+
+
+def generate_expanding_finnish_folds(
+    year: int = 2025, timezone: str = "UTC"
+) -> list[CVFold]:
+    """Jan-Mar/Apr/May through Jan-Oct/Nov/Dec, with an expanding train window."""
+    folds: list[CVFold] = []
+    def boundary(month: int) -> pd.Timestamp:
+        local = pd.Timestamp(year=year, month=1, day=1, tz=timezone) + pd.DateOffset(
+            months=month - 1
+        )
+        return local.tz_convert("UTC")
+
+    for fold_id, validation_month in enumerate(range(4, 12)):
+        train_start = boundary(1)
+        val_start = boundary(validation_month)
+        test_start = boundary(validation_month + 1)
+        test_end_exclusive = boundary(validation_month + 2)
+        folds.append(
+            CVFold(
+                fold_id=fold_id,
+                train_start=train_start,
+                train_end=val_start - pd.Timedelta(nanoseconds=1),
+                val_start=val_start,
+                val_end=test_start - pd.Timedelta(nanoseconds=1),
+                test_start=test_start,
+                test_end=test_end_exclusive - pd.Timedelta(nanoseconds=1),
+            )
+        )
+    return folds
