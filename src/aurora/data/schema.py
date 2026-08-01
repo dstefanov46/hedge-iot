@@ -3,7 +3,32 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-QualityFlag = Literal["ok", "missing", "estimated", "linked_workbook_unresolved"]
+QualityFlag = Literal[
+    "ok",
+    "missing",
+    "estimated",
+    "linked_workbook_unresolved",
+    "malformed_timestamp",
+]
+
+CANONICAL_PV_SCHEMA_VERSION = "pv-15min-v1"
+CANONICAL_PV_COLUMNS = (
+    "site_id",
+    "timestamp_utc",
+    "interval_energy_mwh",
+    "installed_capacity_mw",
+    "capacity_factor",
+    "latitude",
+    "longitude",
+    "timezone",
+    "quality_status",
+    "source",
+    "source_sheet",
+    "source_row",
+    "planned_mwh",
+    "observation_available",
+    "time_idx",
+)
 
 
 class SiteMetadata(BaseModel):
@@ -25,6 +50,7 @@ class ProductionObservation(BaseModel):
     actual_mwh: float | None = None
     source: str
     source_sheet: str | None = None
+    source_row: int | None = Field(default=None, gt=0)
     quality_flag: QualityFlag = "ok"
 
 

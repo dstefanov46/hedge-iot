@@ -12,6 +12,7 @@ dependencies = [
   "numpy>=1.26",
   "pandas>=2.2",
   "openpyxl>=3.1",
+  "pyarrow>=16",
   "pydantic>=2.7",
   "typer>=0.12",
 ]
@@ -50,4 +51,5 @@ extend-ignore = ["B008"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+addopts = "-p no:cacheprovider"
 

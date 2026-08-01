@@ -1,6 +1,7 @@
 import re
+from collections import defaultdict
 from dataclasses import dataclass
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -28,6 +29,7 @@ class WorkbookSummary:
 class WorkbookParseResult:
     path: Path
     records: tuple[ProductionObservation, ...]
+    exclusions: tuple[dict[str, object], ...] = ()
 
 
 def load_hirvensalmi_workbook(path: Path) -> WorkbookSummary:
@@ -59,14 +61,21 @@ def parse_hirvensalmi_workbook(
     timezone = ZoneInfo(source_timezone)
     try:
         records: list[ProductionObservation] = []
+        exclusions: list[dict[str, object]] = []
         for sheet in workbook.worksheets:
             if not re.fullmatch(r"Q[1-4]_\d{2}", sheet.title):
                 continue
-            records.extend(_parse_sheet(sheet, path.name, site_id, timezone))
+            sheet_records, sheet_exclusions = _parse_sheet(sheet, path.name, site_id, timezone)
+            records.extend(sheet_records)
+            exclusions.extend(sheet_exclusions)
     finally:
         workbook.close()
 
-    return WorkbookParseResult(path=path, records=tuple(records))
+    return WorkbookParseResult(
+        path=path,
+        records=tuple(records),
+        exclusions=tuple(exclusions),
+    )
 
 
 def hirvensalmi_records_to_frame(records: tuple[ProductionObservation, ...]) -> pd.DataFrame:
@@ -80,29 +89,41 @@ def hirvensalmi_records_to_frame(records: tuple[ProductionObservation, ...]) -> 
 
 def _parse_sheet(
     sheet, source: str, site_id: str, timezone: ZoneInfo
-) -> list[ProductionObservation]:
-    quarter, year = _parse_quarter_sheet_name(sheet.title)
+) -> tuple[list[ProductionObservation], list[dict[str, object]]]:
+    quarter, _ = _parse_quarter_sheet_name(sheet.title)
     start_row = 3 if quarter == 1 else 4
-    fallback_start = datetime(year, (quarter - 1) * 3 + 1, 1, tzinfo=timezone)
     records: list[ProductionObservation] = []
+    exclusions: list[dict[str, object]] = []
+    local_occurrences: defaultdict[datetime, int] = defaultdict(int)
 
-    for offset, row in enumerate(sheet.iter_rows(min_row=start_row, values_only=True)):
+    for source_row, row in enumerate(
+        sheet.iter_rows(min_row=start_row, values_only=True), start=start_row
+    ):
         if quarter == 1:
-            timestamp = _timestamp_from_q1(row[0], row[1], timezone)
+            local_timestamp = _local_timestamp_from_q1(row[0], row[1])
             planned = _as_float(row[2])
             actual = _as_float(row[3])
         else:
-            timestamp = _as_datetime_utc(row[0], timezone)
+            local_timestamp = _as_local_datetime(row[0])
             planned = _as_float(row[5])
             actual = _as_float(row[6])
 
-        quality_flag = "ok"
-        if timestamp is None:
-            timestamp = (fallback_start + timedelta(minutes=15 * offset)).astimezone(UTC)
-            quality_flag = "linked_workbook_unresolved" if quarter != 1 else "estimated"
-
         if planned is None and actual is None:
             continue
+        if local_timestamp is None:
+            exclusions.append(
+                {
+                    "source_sheet": sheet.title,
+                    "source_row": source_row,
+                    "reason": "malformed_timestamp",
+                    "raw_timestamp": repr(row[0]),
+                }
+            )
+            continue
+
+        occurrence = local_occurrences[local_timestamp]
+        local_occurrences[local_timestamp] += 1
+        timestamp = _local_to_utc(local_timestamp, timezone, occurrence)
 
         records.append(
             ProductionObservation(
@@ -113,11 +134,12 @@ def _parse_sheet(
                 actual_mwh=actual,
                 source=source,
                 source_sheet=sheet.title,
-                quality_flag=quality_flag,
+                source_row=source_row,
+                quality_flag="ok",
             )
         )
 
-    return records
+    return records, exclusions
 
 
 def _parse_quarter_sheet_name(name: str) -> tuple[int, int]:
@@ -128,22 +150,28 @@ def _parse_quarter_sheet_name(name: str) -> tuple[int, int]:
 
 
 def _timestamp_from_q1(date_value, interval_value, timezone: ZoneInfo) -> datetime | None:
-    date_part = _excel_date_to_datetime(date_value, timezone)
-    if date_part is None:
+    local_timestamp = _local_timestamp_from_q1(date_value, interval_value)
+    if local_timestamp is None:
         return None
-
-    interval_start = _parse_interval_start(interval_value) or time(0, 0)
-    local_timestamp = datetime.combine(date_part.date(), interval_start, tzinfo=timezone)
-    return local_timestamp.astimezone(UTC)
+    return _local_to_utc(local_timestamp, timezone, occurrence=0)
 
 
-def _excel_date_to_datetime(value, timezone: ZoneInfo) -> datetime | None:
+def _local_timestamp_from_q1(date_value, interval_value) -> datetime | None:
+    date_part = _excel_local_date(date_value)
+    interval_start = _parse_interval_start(interval_value)
+    if date_part is None or interval_start is None:
+        return None
+    return datetime.combine(date_part, interval_start)
+
+
+def _excel_local_date(value) -> date | None:
     if isinstance(value, datetime):
-        local_value = value.replace(tzinfo=value.tzinfo or timezone)
-        return local_value.astimezone(UTC)
+        return value.date()
+    if isinstance(value, date):
+        return value
     if isinstance(value, (int, float)):
-        parsed = from_excel(value).replace(tzinfo=timezone)
-        return parsed.astimezone(UTC)
+        parsed = from_excel(value)
+        return parsed.date() if isinstance(parsed, (date, datetime)) else None
     return None
 
 
@@ -156,13 +184,28 @@ def _parse_interval_start(value) -> time | None:
     return time(hour=int(match.group(1)), minute=int(match.group(2)))
 
 
-def _as_datetime_utc(value, timezone: ZoneInfo) -> datetime | None:
+def _as_local_datetime(value) -> datetime | None:
     if isinstance(value, datetime):
-        local_value = value.replace(tzinfo=value.tzinfo or timezone)
-        return local_value.astimezone(UTC)
+        return value.replace(tzinfo=None)
     if isinstance(value, (int, float)):
-        return from_excel(value).replace(tzinfo=timezone).astimezone(UTC)
+        parsed = from_excel(value)
+        return parsed.replace(tzinfo=None) if isinstance(parsed, datetime) else None
     return None
+
+
+def _as_datetime_utc(value, timezone: ZoneInfo) -> datetime | None:
+    """Backward-compatible scalar conversion used by older callers and tests."""
+    local = _as_local_datetime(value)
+    return None if local is None else _local_to_utc(local, timezone, occurrence=0)
+
+
+def _local_to_utc(local: datetime, timezone: ZoneInfo, occurrence: int) -> datetime:
+    """Convert a workbook wall-clock time, retaining both autumn DST occurrences."""
+    first = local.replace(tzinfo=timezone, fold=0)
+    second = local.replace(tzinfo=timezone, fold=1)
+    ambiguous = first.utcoffset() != second.utcoffset()
+    fold = 1 if ambiguous and occurrence % 2 == 1 else 0
+    return local.replace(tzinfo=timezone, fold=fold).astimezone(UTC)
 
 
 def _as_float(value) -> float | None:
