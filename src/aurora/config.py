@@ -14,7 +14,7 @@ class ProjectPaths(BaseModel):
 
 
 class ForecastConfig(BaseModel):
-    horizon_steps: int = 96
+    horizon_steps: int = 8
     frequency: str = "15min"
     target_column: str = "actual_mwh"
 

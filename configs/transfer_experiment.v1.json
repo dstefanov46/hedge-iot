@@ -1,0 +1,32 @@
+{
+  "schema_version": "transfer-experiment-v1",
+  "paths": {
+    "slovenian_dataset": "data/processed/slovenia.parquet",
+    "finnish_dataset": "data/processed/hirvensalmi.parquet",
+    "output_root": "outputs/transfer_experiment",
+    "slovenian_checkpoint_root": "models/tft_slovenia",
+    "fold_model_root": "models/tft_finnish_folds",
+    "final_model_root": "models/tft_finnish_final"
+  },
+  "source_hashes": {},
+  "bootstrap_replicates": 100,
+  "bootstrap_block_length": 15,
+  "skill_threshold": 0.10,
+  "tft": {
+    "encoder_length": 8,
+    "horizon_steps": 8,
+    "hidden_size": 32,
+    "attention_head_size": 4,
+    "hidden_continuous_size": 8,
+    "dropout": 0.1,
+    "batch_size": 128,
+    "max_epochs": 50,
+    "patience": 5,
+    "learning_rate": 0.0001,
+    "gradient_clip_val": 0.1,
+    "max_sequences_per_epoch": 10000,
+    "random_seed": 42,
+    "accelerator": "cuda",
+    "num_workers": 0
+  }
+}

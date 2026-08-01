@@ -11,9 +11,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from aurora.data.hirvensalmi import hirvensalmi_records_to_frame, parse_hirvensalmi_workbook
+from aurora.data.canonical import prepare_hirvensalmi_dataset
 from aurora.evaluation.metrics import mae, mse, skill_score
-from aurora.features.solar import calculate_clear_sky_irradiance, calculate_solar_angles
 from aurora.forecasting.baselines import smart_persistence_forecast
 
 DEFAULT_QUANTILES = (0.02, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98)
@@ -106,47 +105,29 @@ def run_tft_plan_comparison(config: ComparisonConfig) -> ComparisonOutputs:
 
 
 def load_and_preprocess(config: ComparisonConfig) -> tuple[pd.DataFrame, dict[str, Any]]:
-    parsed = parse_hirvensalmi_workbook(
-        config.workbook_path,
-        site_id=config.site_id,
-        source_timezone=config.source_timezone,
-    )
-    raw = hirvensalmi_records_to_frame(parsed.records)
-    raw = raw.sort_values("timestamp_utc").reset_index(drop=True)
-
-    duplicate_count = int(raw["timestamp_utc"].duplicated().sum())
-    cleaned = raw.drop_duplicates("timestamp_utc", keep="first").copy()
-    for column in ["actual_mwh", "planned_mwh"]:
-        cleaned[column] = pd.to_numeric(cleaned[column], errors="coerce").fillna(0.0).clip(lower=0)
-
-    timestamps = pd.DatetimeIndex(cleaned["timestamp_utc"])
-    gap_minutes = timestamps.to_series().diff().dt.total_seconds().div(60).dropna()
-    cleaned["time_idx"] = np.arange(len(cleaned), dtype=np.int64)
+    canonical, manifest = prepare_hirvensalmi_dataset(config.workbook_path)
+    cleaned = canonical.loc[canonical["observation_available"]].copy().reset_index(drop=True)
+    cleaned = cleaned.rename(columns={"interval_energy_mwh": "actual_mwh"})
+    cleaned["actual_mwh"] = cleaned["actual_mwh"].clip(lower=0)
+    cleaned["planned_mwh"] = cleaned["planned_mwh"].clip(lower=0)
     cleaned["series_id"] = config.site_id
-
-    local_time = timestamps.tz_convert(config.source_timezone)
-    cleaned["hour_sin"] = np.sin(2 * np.pi * (local_time.hour + local_time.minute / 60) / 24)
-    cleaned["hour_cos"] = np.cos(2 * np.pi * (local_time.hour + local_time.minute / 60) / 24)
-    cleaned["day_sin"] = np.sin(2 * np.pi * local_time.dayofyear / 365.25)
-    cleaned["day_cos"] = np.cos(2 * np.pi * local_time.dayofyear / 365.25)
-    angles = calculate_solar_angles(timestamps, config.latitude, config.longitude)
-    cleaned["solar_azimuth"] = angles["solar_azimuth"].to_numpy()
-    cleaned["solar_elevation"] = angles["solar_elevation"].to_numpy()
-    cleaned["clear_sky_w_m2"] = calculate_clear_sky_irradiance(
-        timestamps,
-        config.latitude,
-        config.longitude,
-    )
-    clear_sky_max = max(float(cleaned["clear_sky_w_m2"].max()), 1.0)
-    cleaned["clear_sky_norm"] = cleaned["clear_sky_w_m2"] / clear_sky_max
+    cleaned["hour_sin"] = cleaned["day_sin_1"]
+    cleaned["hour_cos"] = cleaned["day_cos_1"]
+    cleaned["day_sin"] = cleaned["year_sin_1"]
+    cleaned["day_cos"] = cleaned["year_cos_1"]
+    cleaned["clear_sky_w_m2"] = cleaned["clear_sky_norm"] * 1361.0
+    gap_minutes = cleaned["timestamp_utc"].diff().dt.total_seconds().div(60).dropna()
 
     data_quality = {
         "source": str(config.workbook_path),
-        "raw_records": int(len(raw)),
+        "schema_version": manifest["schema_version"],
+        "raw_records": manifest["observed_row_count"],
         "records_after_duplicate_removal": int(len(cleaned)),
-        "duplicate_timestamps_removed": duplicate_count,
-        "quality_flag_counts": raw["quality_flag"].value_counts(dropna=False).to_dict(),
-        "source_sheet_counts": raw["source_sheet"].value_counts(dropna=False).to_dict(),
+        "duplicate_timestamps_removed": 0,
+        "masked_gaps": manifest["gap_count"],
+        "exclusions": manifest["exclusions"],
+        "quality_flag_counts": canonical["quality_status"].value_counts().to_dict(),
+        "source_sheet_counts": cleaned["source_sheet"].value_counts(dropna=False).to_dict(),
         "timestamp_min_utc": cleaned["timestamp_utc"].min(),
         "timestamp_max_utc": cleaned["timestamp_utc"].max(),
         "gap_minutes_counts": gap_minutes.round(6).value_counts().head(20).to_dict(),
