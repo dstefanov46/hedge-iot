@@ -1,0 +1,8 @@
+{
+  "site_id": "hirvensalmi",
+  "latitude": 61.64,
+  "longitude": 26.78,
+  "projection": "latlon",
+  "resolution_m": 3000,
+  "patch_size": 64
+}

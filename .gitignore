@@ -1,4 +1,5 @@
 .venv/
+configs/satellite.toml
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -15,6 +16,8 @@ data/raw/*
 !data/raw/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
+data/backup/*
+!data/backup/.gitkeep
 outputs/*
 !outputs/.gitkeep
 models/*

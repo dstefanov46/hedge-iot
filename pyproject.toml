@@ -33,6 +33,17 @@ ml = [
 optimization = [
   "cvxpy>=1.5",
 ]
+satellite = [
+  "eumdac>=3.0",
+  "satpy>=0.55",
+  "xarray>=2024.1",
+  "zarr>=2.18",
+  "fsspec>=2024.2",
+  "s3fs>=2024.2",
+  "pyresample>=1.28",
+  "imagecodecs>=2024.1",
+  "netCDF4>=1.6",
+]
 
 [project.scripts]
 aurora = "aurora.cli:app"

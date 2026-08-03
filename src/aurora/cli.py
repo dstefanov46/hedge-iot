@@ -20,8 +20,191 @@ from aurora.experiments.transfer import (
     run_transfer_experiment,
 )
 from aurora.forecasting.tft_transfer import TFTTransferConfig
+from aurora.satellite.acquisition import collect_in_chunks, download_products
+from aurora.satellite.batch import run_satellite_batch
+from aurora.satellite.config import SatelliteConfig, load_site_config
 
 app = typer.Typer(help="AURORA forecasting and optimization workflows.")
+
+
+@app.command("satellite-batch")
+def satellite_batch(
+    start: str = typer.Option(...),
+    end: str = typer.Option(...),
+    site_config: Path = typer.Option(..., exists=True, dir_okay=False),
+    config: Path = typer.Option(Path("configs/satellite.toml"), "--config"),
+    delete_native: bool = typer.Option(False, "--delete-native"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    chunk_hours: int | None = typer.Option(None, min=1),
+) -> None:
+    """Collect, process, verify backup, and optionally delete native archives."""
+    from datetime import datetime
+
+    result = run_satellite_batch(
+        datetime.fromisoformat(start.replace("Z", "+00:00")),
+        datetime.fromisoformat(end.replace("Z", "+00:00")),
+        load_site_config(site_config),
+        _satellite_config(config),
+        delete_native=delete_native,
+        dry_run=dry_run,
+        chunk_hours=chunk_hours,
+    )
+    typer.echo(
+        f"Batch {result['batch_id']}: {len(result['products'])} products; "
+        f"{len(result['failed_products'])} failed"
+    )
+    if result["failed_products"]:
+        raise typer.Exit(1)
+
+
+@app.command("satellite-collect")
+def satellite_collect(
+    start: str = typer.Option("2025-01-01T00:00:00Z"),
+    end: str = typer.Option("2026-01-01T00:00:00Z"),
+    site_config: Path = typer.Option(..., exists=True, dir_okay=False),
+    config: Path = typer.Option(Path("configs/satellite.toml"), "--config"),
+    chunk_hours: int | None = typer.Option(None, min=1),
+) -> None:
+    """Collect and validate HRSEVIRI products in resumable chunks."""
+    from datetime import datetime
+
+    satellite_config = _satellite_config(config)
+    records = collect_in_chunks(
+        datetime.fromisoformat(start.replace("Z", "+00:00")),
+        datetime.fromisoformat(end.replace("Z", "+00:00")),
+        load_site_config(site_config),
+        satellite_config,
+        chunk_hours=chunk_hours,
+    )
+    typer.echo(f"Collected or reused {len(records)} products; manifest is resumable")
+
+
+@app.command("satellite-download")
+def satellite_download(
+    start: str = typer.Option(..., help="UTC ISO-8601 start time."),
+    end: str = typer.Option(..., help="UTC ISO-8601 end time."),
+    site_config: Path = typer.Option(..., exists=True, dir_okay=False),
+    config: Path = typer.Option(Path("configs/satellite.toml"), "--config"),
+) -> None:
+    """Download HRSEVIRI native products and write an acquisition manifest."""
+    from datetime import datetime
+
+    satellite_config = _satellite_config(config)
+    records = download_products(
+        datetime.fromisoformat(start.replace("Z", "+00:00")),
+        datetime.fromisoformat(end.replace("Z", "+00:00")),
+        load_site_config(site_config),
+        satellite_config,
+    )
+    typer.echo(f"Downloaded or reused {len(records)} HRSEVIRI products")
+
+
+@app.command("satellite-preprocess")
+def satellite_preprocess(
+    manifest: Path = typer.Option(..., exists=True, dir_okay=False),
+    site_config: Path = typer.Option(..., exists=True, dir_okay=False),
+    config: Path = typer.Option(Path("configs/satellite.toml"), "--config"),
+) -> None:
+    """Decode native HRSEVIRI products into site-centered patches."""
+    import json
+
+    from aurora.satellite.preprocess import (
+        decode_native,
+        load_normalization_stats,
+        preprocess_channels,
+    )
+
+    values = json.loads(manifest.read_text(encoding="utf-8"))
+    site = load_site_config(site_config)
+    satellite_config = _satellite_config(config)
+    means = scales = None
+    normalization_version = satellite_config.normalization_version
+    if satellite_config.normalization_stats_uri:
+        means, scales, normalization_version = load_normalization_stats(
+            satellite_config.normalization_stats_uri
+        )
+    records = []
+    for product in values.get("products", []):
+        timestamp = datetime_from_record(product["sensing_time"])
+        channels = decode_native(product["local_uri"], site)
+        records.append(
+            preprocess_channels(
+                channels,
+                site,
+                product["product_id"],
+                timestamp,
+                f"{satellite_config.processed_uri}/patches/{product['product_id']}.zarr",
+                means=means,
+                scales=scales,
+                normalization_version=normalization_version,
+            )
+        )
+    output = Path(satellite_config.processed_uri) / "manifest.parquet"
+    import pandas as pd
+
+    pd.DataFrame(records).to_parquet(output, index=False)
+    typer.echo(f"Wrote {len(records)} patch records to {output}")
+
+
+def datetime_from_record(value: str):
+    from datetime import datetime
+
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _satellite_config(path: Path) -> SatelliteConfig:
+    if not path.is_file():
+        raise typer.BadParameter(
+            f"Missing satellite config file: {path}. Copy configs/satellite.example.toml "
+            "to configs/satellite.toml and fill in the credentials."
+        )
+    return SatelliteConfig.from_file(path)
+
+
+@app.command("satellite-embed")
+def satellite_embed(
+    patch_store: Path = typer.Option(..., exists=True),
+    output: Path = typer.Option(...),
+    checkpoint: Path | None = typer.Option(None, exists=True, dir_okay=False),
+) -> None:
+    """Generate provenance-preserving frozen CNN embeddings from patch files."""
+    import numpy as np
+    import pandas as pd
+
+    from aurora.satellite.embedding import FrozenCNNEncoder
+    from aurora.satellite.features import derive_patch_features
+
+    encoder = FrozenCNNEncoder.from_checkpoint(checkpoint) if checkpoint else FrozenCNNEncoder()
+    rows = []
+    patch_paths = [*patch_store.rglob("*.npz"), *patch_store.rglob("*.zarr")]
+    for path in sorted(patch_paths):
+        if path.suffix == ".zarr":
+            import zarr
+
+            patch = np.asarray(zarr.open(path, mode="r"))
+        else:
+            patch = np.load(path)["patch"]
+        metadata_path = path.with_suffix(path.suffix + ".json")
+        metadata = (
+            json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
+        )
+        row = derive_patch_features(
+            patch,
+            str(path),
+            site_id=metadata.get("site_id") or metadata.get("site", {}).get("site_id"),
+            timestamp_utc=metadata.get("timestamp_utc"),
+            product_id=metadata.get("product_id"),
+        )
+        row.update(
+            {
+                f"satellite_embedding_{i:02d}": float(value)
+                for i, value in enumerate(encoder.encode(patch))
+            }
+        )
+        rows.append(row)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(output, index=False)
+    typer.echo(f"Wrote {len(rows)} satellite embeddings to {output}")
 
 
 @app.command()
@@ -226,8 +409,7 @@ def _print_acceptance(pooled: dict[str, object]) -> None:
     threshold = float(acceptance["skill_threshold"])
     typer.echo(f"Pooled daylight point-head MSE skill: {float(pooled['skill']):.6f}")
     typer.echo(
-        "95% interval: "
-        f"[{float(pooled['skill_ci_low']):.6f}, {float(pooled['skill_ci_high']):.6f}]"
+        f"95% interval: [{float(pooled['skill_ci_low']):.6f}, {float(pooled['skill_ci_high']):.6f}]"
     )
     typer.echo(
         f"Point estimate meets {threshold:.0%} threshold: "

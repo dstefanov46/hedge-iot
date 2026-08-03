@@ -1,0 +1,21 @@
+# Copy to configs/satellite.toml. This file contains no credentials.
+
+[satellite]
+api_key = ""
+api_secret = ""
+raw_uri = "data/raw/satellite/native"
+processed_uri = "data/processed/satellite"
+collection = "EO:EUM:DAT:MSG:HRSEVIRI"
+normalization_version = "seviri-global-v1"
+normalization_stats_uri = "data/processed/satellite/normalization_stats.json"
+collection_chunk_hours = 24
+# Required when --delete-native is used; keep this outside raw_uri and processed_uri.
+backup_uri = "data/backup/satellite"
+start_utc = "2025-01-01T00:00:00Z"
+end_utc = "2026-01-01T00:00:00Z"
+max_alignment_minutes = 7.5
+retry_attempts = 4
+timeout_seconds = 60.0
+
+[test]
+run_live_eumetsat = false

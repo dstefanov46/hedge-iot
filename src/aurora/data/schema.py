@@ -79,6 +79,21 @@ class SatelliteFeatureObservation(BaseModel):
     feature_vector_uri: str | None = None
 
 
+class SatellitePatchObservation(BaseModel):
+    site_id: str
+    timestamp_utc: datetime
+    product_id: str
+    provider: str = "EUMETSAT"
+    product: str
+    patch_uri: str
+    channel_names: list[str]
+    height: int = Field(gt=0)
+    width: int = Field(gt=0)
+    missing_fraction: float = Field(ge=0, le=1)
+    quality_status: str
+    normalization_version: str
+
+
 class ForecastRecord(BaseModel):
     site_id: str
     created_at_utc: datetime
