@@ -28,6 +28,10 @@ KNOWN_REALS = (
     "clear_sky_norm",
 )
 STATIC_REALS = ("latitude", "longitude", "installed_capacity_mw")
+SATELLITE_REALS = tuple(
+    [f"satellite_embedding_{i:02d}" for i in range(32)]
+    + ["satellite_missing", "satellite_cloud_index", "satellite_irradiance_proxy"]
+)
 TARGETS = ("target_point", "target_quantiles")
 
 
@@ -51,9 +55,14 @@ class TFTTransferConfig:
     random_seed: int = 42
     accelerator: str = "cuda"
     num_workers: int = 0
+    satellite_enabled: bool = False
+    satellite_embedding_dim: int = 32
+    satellite_missing_value: float = 0.0
+    satellite_max_alignment_minutes: float = 7.5
 
 
 def prepare_tft_frame(frame: pd.DataFrame, config: TFTTransferConfig) -> pd.DataFrame:
+    satellite_columns = set(SATELLITE_REALS) if config.satellite_enabled else set()
     required = {
         "site_id",
         "time_idx",
@@ -61,11 +70,14 @@ def prepare_tft_frame(frame: pd.DataFrame, config: TFTTransferConfig) -> pd.Data
         "observation_available",
         *KNOWN_REALS,
         *STATIC_REALS,
+        *satellite_columns,
     }
     missing = required.difference(frame.columns)
     if missing:
         raise ValueError(f"Missing TFT columns: {sorted(missing)}")
     out = frame.copy().sort_values(["site_id", "time_idx"]).reset_index(drop=True)
+    if config.satellite_enabled and "satellite_issue_timestamp_utc" in out:
+        out = mask_future_satellite_values(out)
     target = pd.to_numeric(out["capacity_factor"], errors="coerce")
     out["target_point"] = target.fillna(0).clip(0, 1).astype(float)
     out["target_quantiles"] = out["target_point"]
@@ -75,7 +87,36 @@ def prepare_tft_frame(frame: pd.DataFrame, config: TFTTransferConfig) -> pd.Data
         observed, np.where(daylight, config.daylight_weight, config.night_weight), 0.0
     ).astype(float)
     out["observation_available_real"] = observed.astype(float)
+    if config.satellite_enabled:
+        # The frame builder is responsible for masking future values; this is a
+        # defensive fill for sparse products and makes missingness explicit.
+        for column in SATELLITE_REALS:
+            out[column] = pd.to_numeric(out[column], errors="coerce").fillna(
+                config.satellite_missing_value
+            )
     out["site_id"] = out["site_id"].astype(str)
+    return out
+
+
+def mask_future_satellite_values(frame: pd.DataFrame) -> pd.DataFrame:
+    """Zero satellite values after each row's forecast issue time.
+
+    This helper is intentionally explicit so callers constructing decoder rows
+    can apply the same leakage guard before creating a TimeSeriesDataSet.
+    """
+    required = {"timestamp_utc", "satellite_issue_timestamp_utc"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"Missing satellite leakage-guard columns: {sorted(missing)}")
+    out = frame.copy()
+    timestamps = pd.to_datetime(out["timestamp_utc"], utc=True)
+    issue = pd.to_datetime(out["satellite_issue_timestamp_utc"], utc=True)
+    future = timestamps > issue
+    for column in SATELLITE_REALS:
+        if column in out:
+            out.loc[future, column] = 0.0
+    if "satellite_missing" in out:
+        out.loc[future, "satellite_missing"] = 1.0
     return out
 
 
@@ -102,6 +143,7 @@ def create_dataset(
         TorchNormalizer(method="identity", center=False),
         TorchNormalizer(method="identity", center=False),
     ]
+    known_reals = [*KNOWN_REALS, *(SATELLITE_REALS if config.satellite_enabled else ())]
     return TimeSeriesDataSet(
         model_frame,
         time_idx="time_idx",
@@ -114,7 +156,7 @@ def create_dataset(
         max_prediction_length=config.horizon_steps,
         min_prediction_idx=min_prediction_idx,
         static_reals=list(STATIC_REALS),
-        time_varying_known_reals=list(KNOWN_REALS),
+        time_varying_known_reals=known_reals,
         time_varying_unknown_reals=[*TARGETS, "observation_available_real"],
         target_normalizer=normalizers,
         categorical_encoders={"site_id": NaNLabelEncoder(add_nan=True)},
@@ -124,6 +166,7 @@ def create_dataset(
             "target_quantiles": 0.0,
             "observation_available_real": 0.0,
             "loss_weight": 0.0,
+            **{column: config.satellite_missing_value for column in SATELLITE_REALS},
         },
         add_relative_time_idx=True,
         add_encoder_length=True,
@@ -311,7 +354,8 @@ def save_model_bundle(
         "legacy_one_step_checkpoints_compatible": False,
         "config": asdict(config),
         "features": {
-            "known_reals": list(KNOWN_REALS),
+            "known_reals": list(KNOWN_REALS)
+            + (list(SATELLITE_REALS) if config.satellite_enabled else []),
             "static_reals": list(STATIC_REALS),
             "targets": list(TARGETS),
             "site_id_is_model_feature": False,

@@ -12,6 +12,13 @@
   "bootstrap_replicates": 100,
   "bootstrap_block_length": 15,
   "skill_threshold": 0.10,
+  "satellite": {
+    "enabled": false,
+    "embedding_dim": 32,
+    "encoder_only": true,
+    "missing_value": 0.0,
+    "max_alignment_minutes": 7.5
+  },
   "tft": {
     "encoder_length": 8,
     "horizon_steps": 8,

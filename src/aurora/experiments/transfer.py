@@ -40,6 +40,7 @@ class TransferExperimentConfig:
     bootstrap_replicates: int = 100
     bootstrap_block_length: int = 15
     skill_threshold: float = 0.10
+    satellite: dict[str, object] | None = None
 
     @classmethod
     def from_json(cls, path: Path) -> TransferExperimentConfig:
@@ -60,11 +61,25 @@ class TransferExperimentConfig:
             fold_model_root=Path(paths["fold_model_root"]),
             final_model_root=Path(paths["final_model_root"]),
             source_hashes=values.get("source_hashes", {}),
-            tft=TFTTransferConfig(**values.get("tft", {})),
+            tft=TFTTransferConfig(
+                **{**values.get("tft", {}), **_satellite_tft_values(values.get("satellite"))}
+            ),
             bootstrap_replicates=int(values.get("bootstrap_replicates", 100)),
             bootstrap_block_length=int(values.get("bootstrap_block_length", 15)),
             skill_threshold=float(values.get("skill_threshold", 0.10)),
+            satellite=values.get("satellite"),
         )
+
+
+def _satellite_tft_values(values: dict[str, object] | None) -> dict[str, object]:
+    if not values or not bool(values.get("enabled", False)):
+        return {}
+    return {
+        "satellite_enabled": True,
+        "satellite_embedding_dim": int(values.get("embedding_dim", 32)),
+        "satellite_missing_value": float(values.get("missing_value", 0.0)),
+        "satellite_max_alignment_minutes": float(values.get("max_alignment_minutes", 7.5)),
+    }
 
 
 def pretrain_slovenian_tft(
@@ -214,8 +229,7 @@ def _run_fold(
     )
     target_lookup = through_test.drop_duplicates("timestamp_utc").set_index("timestamp_utc")
     predictions["existing_plan"] = predictions["target_timestamp_utc"].map(
-        target_lookup["planned_mwh"]
-        / (target_lookup["installed_capacity_mw"] * 0.25)
+        target_lookup["planned_mwh"] / (target_lookup["installed_capacity_mw"] * 0.25)
     )
     predictions["split"] = "test"
     predictions["fold"] = fold.fold_id
@@ -357,9 +371,7 @@ def reevaluate_transfer_predictions(
     if "fold" in predictions:
         for fold, fold_predictions in predictions.groupby("fold", sort=True):
             fold_label = str(int(fold)) if float(fold).is_integer() else str(fold)
-            fold_predictions.to_csv(
-                output_root / f"predictions_fold_{fold_label}.csv", index=False
-            )
+            fold_predictions.to_csv(output_root / f"predictions_fold_{fold_label}.csv", index=False)
     metrics.to_csv(output_root / "metrics.csv", index=False)
     (output_root / "pooled_metrics.json").write_text(
         json.dumps(pooled, indent=2, sort_keys=True), encoding="utf-8"
@@ -395,16 +407,16 @@ def _attach_fold_baselines(
     experiment_schema: str,
 ) -> pd.DataFrame:
     keys = ["issue_timestamp_utc", "target_timestamp_utc", "horizon_step"]
-    harmonic = HarmonicSmartPersistence().fit(train_frame).predict_long(
-        through_test, issues, horizon_steps
+    harmonic = (
+        HarmonicSmartPersistence()
+        .fit(train_frame)
+        .predict_long(through_test, issues, horizon_steps)
     )
     if experiment_schema == "transfer-experiment-v1":
         return predictions.merge(harmonic, on=keys, how="left", validate="many_to_one")
     if experiment_schema != "transfer-experiment-v2":
         raise ValueError(f"Unsupported transfer experiment schema: {experiment_schema}")
-    harmonic = harmonic.rename(
-        columns={"smart_persistence": "legacy_harmonic_smart_persistence"}
-    )
+    harmonic = harmonic.rename(columns={"smart_persistence": "legacy_harmonic_smart_persistence"})
     physical = PhysicalSmartPersistence().predict_long(through_test, issues, horizon_steps)
     return predictions.merge(harmonic, on=keys, how="left", validate="many_to_one").merge(
         physical, on=keys, how="left", validate="many_to_one"
