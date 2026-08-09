@@ -16,6 +16,9 @@ end_utc = "2026-01-01T00:00:00Z"
 max_alignment_minutes = 7.5
 retry_attempts = 4
 timeout_seconds = 60.0
+token_validity_seconds = 86400
+discovery_retry_attempts = 8
+discovery_retry_max_backoff_seconds = 60
 
 [test]
 run_live_eumetsat = false

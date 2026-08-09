@@ -54,11 +54,26 @@ class SatelliteConfig:
     max_alignment_minutes: float = 7.5
     retry_attempts: int = 4
     timeout_seconds: float = 60.0
+    token_validity_seconds: int = 86400
+    discovery_retry_attempts: int = 8
+    discovery_retry_max_backoff_seconds: float = 60.0
     collection_chunk_hours: int = 24
     backup_uri: str | None = None
     normalization_stats_uri: str | None = None
     start_utc: str = "2025-01-01T00:00:00Z"
     end_utc: str = "2026-01-01T00:00:00Z"
+    download_workers: int = 4
+    processing_workers: int = 6
+    pipeline_queue_size: int = 12
+
+    def __post_init__(self) -> None:
+        for name in ("token_validity_seconds", "discovery_retry_attempts"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        backoff = self.discovery_retry_max_backoff_seconds
+        if isinstance(backoff, bool) or not isinstance(backoff, (int, float)) or backoff <= 0:
+            raise ValueError("discovery_retry_max_backoff_seconds must be positive")
 
     @classmethod
     def from_file(cls, path: str | os.PathLike[str]) -> SatelliteConfig:
@@ -98,6 +113,12 @@ class SatelliteConfig:
             raise ValueError("collection_chunk_hours must be positive")
         if tuple(self.channels) != tuple(CHANNEL_NAMES):
             raise ValueError("HRSEVIRI preprocessing requires exactly the configured 12 channels")
+        for name in ("download_workers", "processing_workers", "pipeline_queue_size"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.pipeline_queue_size < max(self.download_workers, self.processing_workers):
+            raise ValueError("pipeline_queue_size must be at least the worker count")
 
     def validate_credentials(self) -> None:
         if not self.api_key or not self.api_secret:
