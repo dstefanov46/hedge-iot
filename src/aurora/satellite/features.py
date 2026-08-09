@@ -22,19 +22,26 @@ def derive_patch_features(
     }
     for i, channel in enumerate(CHANNEL_NAMES):
         sample = values[i][np.isfinite(values[i])]
-        for suffix, value in (
-            ("mean", np.mean(sample)),
-            ("std", np.std(sample)),
-            ("min", np.min(sample)),
-            ("max", np.max(sample)),
-        ):
-            result[f"satellite_{channel.lower()}_{suffix}"] = (
-                float(value) if sample.size else float("nan")
-            )
+        statistics = (
+            {
+                "mean": float(np.mean(sample)),
+                "std": float(np.std(sample)),
+                "min": float(np.min(sample)),
+                "max": float(np.max(sample)),
+            }
+            if sample.size
+            else {name: float("nan") for name in ("mean", "std", "min", "max")}
+        )
+        for suffix, value in statistics.items():
+            result[f"satellite_{channel.lower()}_{suffix}"] = value
     visible = values[[0, 1, 2]]
     infrared = values[[3, 4, 5, 6, 7, 8, 9, 10]]
-    result["satellite_cloud_index"] = float(np.nanmean(visible) / (np.nanmean(infrared) + 1e-6))
-    result["satellite_irradiance_proxy"] = float(np.nanmean(visible))
+    visible_sample = visible[np.isfinite(visible)]
+    infrared_sample = infrared[np.isfinite(infrared)]
+    visible_mean = float(np.mean(visible_sample)) if visible_sample.size else float("nan")
+    infrared_mean = float(np.mean(infrared_sample)) if infrared_sample.size else float("nan")
+    result["satellite_cloud_index"] = visible_mean / (infrared_mean + 1e-6)
+    result["satellite_irradiance_proxy"] = visible_mean
     return result
 
 

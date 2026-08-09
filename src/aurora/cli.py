@@ -36,23 +36,69 @@ def satellite_batch(
     delete_native: bool = typer.Option(False, "--delete-native"),
     dry_run: bool = typer.Option(False, "--dry-run"),
     chunk_hours: int | None = typer.Option(None, min=1),
+    download_workers: int | None = typer.Option(None, min=1, help="Concurrent download workers."),
+    processing_workers: int | None = typer.Option(None, min=1, help="Concurrent Satpy workers."),
+    pipeline_queue_size: int | None = typer.Option(None, min=1, help="Bounded pipeline queue size."),
 ) -> None:
     """Collect, process, verify backup, and optionally delete native archives."""
     from datetime import datetime
 
+    satellite_config = _satellite_config(config)
+    overrides = {k: v for k, v in {"download_workers": download_workers,
+                                   "processing_workers": processing_workers,
+                                   "pipeline_queue_size": pipeline_queue_size}.items()
+                 if v is not None}
+    if overrides:
+        from dataclasses import replace
+        satellite_config = replace(satellite_config, **overrides)
     result = run_satellite_batch(
         datetime.fromisoformat(start.replace("Z", "+00:00")),
         datetime.fromisoformat(end.replace("Z", "+00:00")),
         load_site_config(site_config),
-        _satellite_config(config),
+        satellite_config,
         delete_native=delete_native,
         dry_run=dry_run,
         chunk_hours=chunk_hours,
     )
     typer.echo(
         f"Batch {result['batch_id']}: {len(result['products'])} products; "
-        f"{len(result['failed_products'])} failed"
+        f"{len(result['failed_products'])} failed; "
+        f"{len(result['unavailable_products'])} unavailable; "
+        f"interval {result['interval']['start']} to {result['interval']['end']}"
     )
+    discovery = result["discovery"]
+    typer.echo(
+        "Discovery: "
+        f"covered chunks={discovery['covered_chunks']}/{discovery['total_chunks']}; "
+        f"remaining uncovered chunks={discovery['remaining_uncovered_chunks']}; "
+        "confirmed missing 15-minute source slots="
+        f"{discovery['confirmed_missing_15_minute_source_slots']}"
+    )
+    typer.echo(f"Workers: download={result['workers']['download']}, processing={result['workers']['processing']}")
+    executor = result["processing_executor"]
+    typer.echo(
+        f"Processing executor: {executor['type']}; observed workers="
+        f"{executor['observed_workers']}/{executor['configured_workers']}"
+    )
+    for worker in executor["workers"]:
+        typer.echo(
+            f"  PID {worker['pid']}: tasks={worker['tasks']}, "
+            f"wall={worker['wall_seconds']:.3f}s, cpu={worker['cpu_seconds']:.3f}s, "
+            f"affinity={worker['affinity_cpus']}, "
+            f"native_threads={worker['native_threads_before']}->"
+            f"{worker['native_threads_during_decode']}->"
+            f"{worker['native_threads_after_decode']}, "
+            f"dask={worker['dask_scheduler']}/{worker['dask_workers']}"
+        )
+        if worker["threadpools_during_decode"]:
+            pools = ",".join(
+                f"{pool['prefix']}={pool['num_threads']}"
+                for pool in worker["threadpools_during_decode"]
+            )
+            typer.echo(f"    native pools during decode: {pools}")
+    typer.echo("Timing summary (seconds):")
+    for stage, elapsed in result["timings"].items():
+        typer.echo(f"  {stage}: {elapsed:.3f}")
     if result["failed_products"]:
         raise typer.Exit(1)
 

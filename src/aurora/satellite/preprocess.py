@@ -14,6 +14,12 @@ import numpy as np
 from aurora.satellite.config import CHANNEL_NAMES, SiteConfig
 
 
+class EmptySatelliteProductError(ValueError):
+    """The decoded site patch contains no finite source pixels."""
+
+    reason = "all_channels_non_finite"
+
+
 def validate_channels(
     channels: dict[str, np.ndarray], expected: tuple[str, ...] = CHANNEL_NAMES
 ) -> None:
@@ -57,6 +63,8 @@ def validate_patch(
         raise ValueError(f"Expected {expected_channels} channels, got {patch.shape[0]}")
     if patch.shape[1:] != (expected_size, expected_size):
         raise ValueError(f"Expected {(expected_size, expected_size)} patch, got {patch.shape[1:]}")
+    if not np.isfinite(patch).any():
+        raise EmptySatelliteProductError("all satellite channels contain no finite pixels")
     missing = float(np.isnan(patch).mean())
     if missing > 1:
         raise ValueError("invalid missing fraction")

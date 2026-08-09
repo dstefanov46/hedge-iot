@@ -43,6 +43,7 @@ satellite = [
   "pyresample>=1.28",
   "imagecodecs>=2024.1",
   "netCDF4>=1.6",
+  "threadpoolctl>=3.5",
 ]
 
 [project.scripts]
@@ -63,4 +64,3 @@ extend-ignore = ["B008"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-p no:cacheprovider"
-
