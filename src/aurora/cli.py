@@ -16,7 +16,9 @@ from aurora.experiments.transfer import (
     fit_final_finnish_checkpoint,
     pretrain_slovenian_tft,
     reevaluate_transfer_predictions,
+    report_finnish_weather_ablation,
     run_finnish_rolling_evaluation,
+    run_tft_loss_sweep,
     run_transfer_experiment,
 )
 from aurora.forecasting.tft_transfer import TFTTransferConfig
@@ -38,18 +40,26 @@ def satellite_batch(
     chunk_hours: int | None = typer.Option(None, min=1),
     download_workers: int | None = typer.Option(None, min=1, help="Concurrent download workers."),
     processing_workers: int | None = typer.Option(None, min=1, help="Concurrent Satpy workers."),
-    pipeline_queue_size: int | None = typer.Option(None, min=1, help="Bounded pipeline queue size."),
+    pipeline_queue_size: int | None = typer.Option(
+        None, min=1, help="Bounded pipeline queue size."
+    ),
 ) -> None:
     """Collect, process, verify backup, and optionally delete native archives."""
     from datetime import datetime
 
     satellite_config = _satellite_config(config)
-    overrides = {k: v for k, v in {"download_workers": download_workers,
-                                   "processing_workers": processing_workers,
-                                   "pipeline_queue_size": pipeline_queue_size}.items()
-                 if v is not None}
+    overrides = {
+        k: v
+        for k, v in {
+            "download_workers": download_workers,
+            "processing_workers": processing_workers,
+            "pipeline_queue_size": pipeline_queue_size,
+        }.items()
+        if v is not None
+    }
     if overrides:
         from dataclasses import replace
+
         satellite_config = replace(satellite_config, **overrides)
     result = run_satellite_batch(
         datetime.fromisoformat(start.replace("Z", "+00:00")),
@@ -74,7 +84,11 @@ def satellite_batch(
         "confirmed missing 15-minute source slots="
         f"{discovery['confirmed_missing_15_minute_source_slots']}"
     )
-    typer.echo(f"Workers: download={result['workers']['download']}, processing={result['workers']['processing']}")
+    typer.echo(
+        "Workers: "
+        f"download={result['workers']['download']}, "
+        f"processing={result['workers']['processing']}"
+    )
     executor = result["processing_executor"]
     typer.echo(
         f"Processing executor: {executor['type']}; observed workers="
@@ -317,9 +331,20 @@ def pretrain_slovenian(
     dataset: Path = typer.Argument(..., exists=True, dir_okay=False),
     output: Path = typer.Option(Path("models/tft_slovenia")),
     config: Path | None = typer.Option(None, exists=True, dir_okay=False),
+    resume_checkpoint: Path | None = typer.Option(
+        None,
+        exists=True,
+        dir_okay=False,
+        help="Resume interrupted pretraining from a Lightning checkpoint.",
+    ),
 ) -> None:
     """Pretrain the global eight-horizon TFT on Slovenian sites."""
-    checkpoint, metadata = pretrain_slovenian_tft(dataset, output, _tft_config(config))
+    checkpoint, metadata = pretrain_slovenian_tft(
+        dataset,
+        output,
+        _tft_config(config),
+        resume_checkpoint=resume_checkpoint,
+    )
     typer.echo(f"Best checkpoint: {checkpoint}")
     typer.echo(f"Best validation loss: {metadata['best_validation_loss']}")
 
@@ -332,6 +357,11 @@ def fine_tune_finnish(
     model_root: Path = typer.Option(Path("models/tft_finnish_folds")),
     config: Path | None = typer.Option(None, exists=True, dir_okay=False),
     enforce_gate: bool = typer.Option(True, "--enforce-gate/--no-enforce-gate"),
+    resume: bool = typer.Option(
+        False,
+        "--resume/--no-resume",
+        help="Resume completed folds and interrupted fold checkpoints in the output directory.",
+    ),
 ) -> None:
     """Fine-tune every Finnish fold and run rolling out-of-fold evaluation."""
     _, _, pooled, epochs = run_finnish_rolling_evaluation(
@@ -341,6 +371,7 @@ def fine_tune_finnish(
         model_root,
         _tft_config(config),
         enforce_gate=enforce_gate,
+        resume=resume,
     )
     _print_acceptance(pooled)
     typer.echo(f"Fold best epochs: {epochs}")
@@ -373,6 +404,64 @@ def run_transfer_experiment_command(
     """Run preprocessing-independent pretraining, transfer evaluation, and final fit."""
     summary = run_transfer_experiment(config)
     _print_acceptance(summary["pooled_metrics"])
+
+
+@app.command("report-weather-ablation")
+def report_weather_ablation_command(
+    baseline_output: Path = typer.Argument(..., exists=True, file_okay=False),
+    weather_output: Path = typer.Argument(..., exists=True, file_okay=False),
+    output: Path = typer.Option(Path("outputs/finnish_weather_ablation")),
+) -> None:
+    """Report valid-weather Finnish ablation against an existing satellite run."""
+    summary = report_finnish_weather_ablation(baseline_output, weather_output, output)
+    for model, values in summary["pooled"].items():
+        typer.echo(f"{model}: MAE={values['mae']:.6f}, MSE={values['mse']:.6f}")
+    availability = summary["availability"]
+    typer.echo(
+        "Valid weather rows: "
+        f"{availability['rows_valid']}/{availability['rows_total']} "
+        f"({availability['issue_timestamp_available_pct']:.2f}% issue metadata)"
+    )
+
+
+@app.command("tft-loss-sweep")
+def tft_loss_sweep_command(
+    dataset: Path = typer.Argument(..., exists=True, dir_okay=False),
+    pretrained_checkpoint: Path = typer.Option(..., exists=True, dir_okay=False),
+    current_output: Path = typer.Option(..., exists=True, file_okay=False),
+    output: Path = typer.Option(Path("outputs/tft_loss_sweep")),
+    model_root: Path = typer.Option(Path("models/tft_loss_sweep")),
+    config: Path | None = typer.Option(None, exists=True, dir_okay=False),
+    profiles: str = typer.Option(
+        "mse-heavy,balanced-huber-mse,mae-heavy",
+        help="Comma-separated loss profiles; use pure-mae for exactly 1.00 x MAE.",
+    ),
+) -> None:
+    """Compare three point-loss TFT fine-tunes with the current checkpoint."""
+    values = json.loads(config.read_text(encoding="utf-8")) if config else {}
+    experiment_values = values if "paths" in values else None
+    tft_config = _tft_config(config)
+    comparison = run_tft_loss_sweep(
+        dataset_path=dataset,
+        pretrained_checkpoint=pretrained_checkpoint,
+        current_output=current_output,
+        output_root=output,
+        model_root=model_root,
+        config=tft_config,
+        bootstrap_replicates=int(experiment_values.get("bootstrap_replicates", 100))
+        if experiment_values
+        else 100,
+        bootstrap_block_length=int(experiment_values.get("bootstrap_block_length", 15))
+        if experiment_values
+        else 15,
+        skill_threshold=float(experiment_values.get("skill_threshold", 0.10))
+        if experiment_values
+        else 0.10,
+        profiles=tuple(profile.strip() for profile in profiles.split(",") if profile.strip()),
+    )
+    columns = ["profile", "mae", "mse", "mae_delta_vs_current", "mse_delta_vs_current"]
+    typer.echo(comparison[columns].to_string(index=False))
+    typer.echo(f"Comparison: {output / 'loss_sweep_comparison.csv'}")
 
 
 @app.command("reevaluate-transfer")
@@ -442,9 +531,21 @@ def optimize() -> None:
 def _tft_config(path: Path | None) -> TFTTransferConfig:
     if path is None:
         return TFTTransferConfig()
-    values = json.loads(path.read_text(encoding="utf-8"))
-    if "tft" in values:
-        values = values["tft"]
+    document = json.loads(path.read_text(encoding="utf-8"))
+    values = dict(document.get("tft", document))
+    satellite = document.get("satellite", {})
+    if satellite.get("enabled", False):
+        values.update(
+            {
+                "satellite_enabled": True,
+                "satellite_encoder_only": bool(satellite.get("encoder_only", True)),
+                "satellite_embedding_dim": int(satellite.get("embedding_dim", 32)),
+                "satellite_missing_value": float(satellite.get("missing_value", 0.0)),
+                "satellite_max_alignment_minutes": float(
+                    satellite.get("max_alignment_minutes", 7.5)
+                ),
+            }
+        )
     return TFTTransferConfig(**values)
 
 

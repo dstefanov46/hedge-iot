@@ -58,7 +58,12 @@ class WeatherObservation(BaseModel):
     site_id: str
     timestamp_utc: datetime
     provider: str
+    weather_provider: str | None = None
+    weather_model: str | None = None
     forecast_reference_utc: datetime | None = None
+    weather_forecast_reference_utc: datetime | None = None
+    weather_issue_timestamp_available: bool = False
+    weather_lead_hours: float | None = Field(default=None, ge=0)
     horizon_hours: float | None = Field(default=None, ge=0)
     ghi_w_m2: float | None = Field(default=None, ge=0)
     dni_w_m2: float | None = Field(default=None, ge=0)
@@ -66,6 +71,11 @@ class WeatherObservation(BaseModel):
     temperature_c: float | None = None
     wind_speed_m_s: float | None = Field(default=None, ge=0)
     humidity_pct: float | None = Field(default=None, ge=0, le=100)
+    dew_point_c: float | None = None
+    wind_direction_deg: float | None = Field(default=None, ge=0, le=360)
+    precipitation_mm: float | None = Field(default=None, ge=0)
+    shortwave_radiation_w_m2: float | None = Field(default=None, ge=0)
+    surface_pressure_hpa: float | None = Field(default=None, ge=0)
 
 
 class SatelliteFeatureObservation(BaseModel):

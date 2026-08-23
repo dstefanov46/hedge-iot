@@ -45,6 +45,10 @@ satellite = [
   "netCDF4>=1.6",
   "threadpoolctl>=3.5",
 ]
+nwp = [
+  "cfgrib>=0.9.15",
+  "eccodes>=2.36",
+]
 
 [project.scripts]
 aurora = "aurora.cli:app"

@@ -28,9 +28,29 @@ KNOWN_REALS = (
     "clear_sky_norm",
 )
 STATIC_REALS = ("latitude", "longitude", "installed_capacity_mw")
+PHYSICAL_CONTEXT_REALS = (
+    "observed_capacity_factor",
+    "clear_sky_index",
+    "clear_sky_index_available",
+)
 SATELLITE_REALS = tuple(
     [f"satellite_embedding_{i:02d}" for i in range(32)]
     + ["satellite_missing", "satellite_cloud_index", "satellite_irradiance_proxy"]
+)
+WEATHER_REALS = (
+    "weather_temperature_2m",
+    "weather_relative_humidity_2m",
+    "weather_dew_point_2m",
+    "weather_wind_speed_10m",
+    "weather_wind_direction_10m",
+    "weather_cloud_cover",
+    "weather_low_cloud_cover",
+    "weather_precipitation",
+    "weather_shortwave_radiation",
+    "weather_surface_pressure",
+    "weather_available",
+    "weather_issue_timestamp_available",
+    "weather_lead_hours",
 )
 TARGETS = ("target_point", "target_quantiles")
 
@@ -56,13 +76,17 @@ class TFTTransferConfig:
     accelerator: str = "cuda"
     num_workers: int = 0
     satellite_enabled: bool = False
+    satellite_encoder_only: bool = True
     satellite_embedding_dim: int = 32
     satellite_missing_value: float = 0.0
     satellite_max_alignment_minutes: float = 7.5
+    point_loss: str = "mse"
+    weather_enabled: bool = False
 
 
 def prepare_tft_frame(frame: pd.DataFrame, config: TFTTransferConfig) -> pd.DataFrame:
     satellite_columns = set(SATELLITE_REALS) if config.satellite_enabled else set()
+    weather_columns = set(WEATHER_REALS) if config.weather_enabled else set()
     required = {
         "site_id",
         "time_idx",
@@ -71,17 +95,27 @@ def prepare_tft_frame(frame: pd.DataFrame, config: TFTTransferConfig) -> pd.Data
         *KNOWN_REALS,
         *STATIC_REALS,
         *satellite_columns,
+        *weather_columns,
     }
     missing = required.difference(frame.columns)
     if missing:
         raise ValueError(f"Missing TFT columns: {sorted(missing)}")
     out = frame.copy().sort_values(["site_id", "time_idx"]).reset_index(drop=True)
-    if config.satellite_enabled and "satellite_issue_timestamp_utc" in out:
-        out = mask_future_satellite_values(out)
     target = pd.to_numeric(out["capacity_factor"], errors="coerce")
     out["target_point"] = target.fillna(0).clip(0, 1).astype(float)
     out["target_quantiles"] = out["target_point"]
     observed = out["observation_available"].astype(bool)
+    clear_sky = pd.to_numeric(out["clear_sky_norm"], errors="coerce")
+    valid_clear_sky = clear_sky > 1e-6
+    out["observed_capacity_factor"] = np.where(observed, target.fillna(0).clip(0, 1), 0.0).astype(
+        float
+    )
+    out["clear_sky_index_available"] = (observed & valid_clear_sky).astype(float)
+    out["clear_sky_index"] = np.where(
+        observed & valid_clear_sky,
+        np.clip(target.fillna(0) / clear_sky.where(valid_clear_sky), 0, 1),
+        0.0,
+    ).astype(float)
     daylight = out["solar_elevation"] > 0
     out["loss_weight"] = np.where(
         observed, np.where(daylight, config.daylight_weight, config.night_weight), 0.0
@@ -94,6 +128,19 @@ def prepare_tft_frame(frame: pd.DataFrame, config: TFTTransferConfig) -> pd.Data
             out[column] = pd.to_numeric(out[column], errors="coerce").fillna(
                 config.satellite_missing_value
             )
+    if config.weather_enabled:
+        for column in WEATHER_REALS:
+            out[column] = pd.to_numeric(out[column], errors="coerce").fillna(0.0)
+        # A decoder row is only allowed to use weather issued at or before the
+        # sequence issue. Unknown issue metadata is explicitly unavailable.
+        if "weather_forecast_reference_utc" in out and "timestamp_utc" in out:
+            target_ts = pd.to_datetime(out["timestamp_utc"], utc=True)
+            issue_ts = pd.to_datetime(out["weather_forecast_reference_utc"], utc=True)
+            unavailable = issue_ts.isna() | (out["weather_issue_timestamp_available"] <= 0)
+            out.loc[unavailable, list(WEATHER_REALS)] = 0.0
+            future = issue_ts.notna() & (target_ts <= issue_ts)
+            out.loc[future, list(WEATHER_REALS)] = 0.0
+            out.loc[future, "weather_available"] = 0.0
     out["site_id"] = out["site_id"].astype(str)
     return out
 
@@ -120,6 +167,20 @@ def mask_future_satellite_values(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def assert_usable_weather(frame: pd.DataFrame) -> None:
+    """Require real issue-time-aware weather before a weather training run."""
+    required = {"weather_issue_timestamp_available", "weather_available"}
+    missing = required - set(frame)
+    if missing:
+        raise AssertionError(f"Missing required weather availability columns: {sorted(missing)}")
+    issue_available = pd.to_numeric(
+        frame["weather_issue_timestamp_available"], errors="coerce"
+    ).fillna(0.0)
+    weather_available = pd.to_numeric(frame["weather_available"], errors="coerce").fillna(0.0)
+    assert issue_available.mean() > 0, "No issue-time-aware weather rows are available"
+    assert weather_available.mean() > 0, "No usable weather rows are available"
+
+
 def create_dataset(
     frame: pd.DataFrame,
     config: TFTTransferConfig,
@@ -143,7 +204,15 @@ def create_dataset(
         TorchNormalizer(method="identity", center=False),
         TorchNormalizer(method="identity", center=False),
     ]
-    known_reals = [*KNOWN_REALS, *(SATELLITE_REALS if config.satellite_enabled else ())]
+    satellite_known = (
+        SATELLITE_REALS if config.satellite_enabled and not config.satellite_encoder_only else ()
+    )
+    satellite_unknown = (
+        SATELLITE_REALS if config.satellite_enabled and config.satellite_encoder_only else ()
+    )
+    known_reals = [*KNOWN_REALS, *satellite_known]
+    if config.weather_enabled:
+        known_reals.extend(WEATHER_REALS)
     return TimeSeriesDataSet(
         model_frame,
         time_idx="time_idx",
@@ -157,7 +226,12 @@ def create_dataset(
         min_prediction_idx=min_prediction_idx,
         static_reals=list(STATIC_REALS),
         time_varying_known_reals=known_reals,
-        time_varying_unknown_reals=[*TARGETS, "observation_available_real"],
+        time_varying_unknown_reals=[
+            *TARGETS,
+            "observation_available_real",
+            *PHYSICAL_CONTEXT_REALS,
+            *satellite_unknown,
+        ],
         target_normalizer=normalizers,
         categorical_encoders={"site_id": NaNLabelEncoder(add_nan=True)},
         allow_missing_timesteps=True,
@@ -167,6 +241,7 @@ def create_dataset(
             "observation_available_real": 0.0,
             "loss_weight": 0.0,
             **{column: config.satellite_missing_value for column in SATELLITE_REALS},
+            **{column: 0.0 for column in WEATHER_REALS},
         },
         add_relative_time_idx=True,
         add_encoder_length=True,
@@ -179,9 +254,30 @@ def create_model(dataset: Any, config: TFTTransferConfig) -> Any:
     from pytorch_forecasting import TemporalFusionTransformer
     from pytorch_forecasting.metrics import MultiLoss, QuantileLoss
 
-    from aurora.forecasting.losses import PointMSE
+    from aurora.forecasting.losses import (
+        PointBalancedHuberMSE,
+        PointMAE,
+        PointMAEHeavy,
+        PointMSE,
+        PointMSEHeavy,
+    )
 
-    loss = MultiLoss([PointMSE(), QuantileLoss(quantiles=list(QUANTILES))])
+    point_losses = {
+        "mse": PointMSE,
+        "mse-heavy": PointMSEHeavy,
+        "balanced-huber-mse": PointBalancedHuberMSE,
+        "mae-heavy": PointMAEHeavy,
+        "pure-mae": PointMAE,
+    }
+    try:
+        point_loss = point_losses[config.point_loss]()
+    except KeyError as exc:
+        choices = ", ".join(sorted(point_losses))
+        raise ValueError(
+            f"Unknown point_loss {config.point_loss!r}; choose from {choices}"
+        ) from exc
+
+    loss = MultiLoss([point_loss, QuantileLoss(quantiles=list(QUANTILES))])
     return TemporalFusionTransformer.from_dataset(
         dataset,
         learning_rate=config.learning_rate,
@@ -191,7 +287,9 @@ def create_model(dataset: Any, config: TFTTransferConfig) -> Any:
         hidden_continuous_size=config.hidden_continuous_size,
         output_size=[1, len(QUANTILES)],
         loss=loss,
-        reduce_on_plateau_patience=2,
+        # PyTorch Forecasting uses this value for both plateau patience and
+        # scheduler cooldown. Five epochs avoids rapid successive reductions.
+        reduce_on_plateau_patience=5,
         log_interval=-1,
     )
 
@@ -225,10 +323,20 @@ def fit_tft(
     checkpoint_dir: Path,
     pretrained_checkpoint: Path | None = None,
     fixed_epochs: int | None = None,
+    resume_checkpoint: Path | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     import torch
+    from lightning.fabric.plugins.io import TorchCheckpointIO
     from lightning.pytorch import Trainer, seed_everything
     from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+
+    class _TrustedCheckpointIO(TorchCheckpointIO):
+        """Allow resuming trusted local Lightning checkpoints under PyTorch 2.6+."""
+
+        def load_checkpoint(
+            self, path: Any, map_location: Any = None, **kwargs: Any
+        ) -> dict[str, Any]:
+            return torch.load(path, map_location=map_location, weights_only=False)
 
     seed_everything(config.random_seed, workers=True)
     random.seed(config.random_seed)
@@ -268,13 +376,19 @@ def fit_tft(
         enable_model_summary=False,
         enable_progress_bar=False,
         num_sanity_val_steps=0,
+        plugins=[_TrustedCheckpointIO()] if resume_checkpoint is not None else None,
     )
     model = (
         transfer_weights(pretrained_checkpoint, train_dataset, config)
         if pretrained_checkpoint is not None
         else create_model(train_dataset, config)
     )
-    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    trainer.fit(
+        model,
+        train_dataloaders=train_loader,
+        val_dataloaders=val_loader,
+        ckpt_path=str(resume_checkpoint) if resume_checkpoint is not None else None,
+    )
     best_path = checkpoint.best_model_path
     best_model = model
     if best_path:
@@ -290,6 +404,7 @@ def fit_tft(
         "best_epoch": _checkpoint_epoch(best_path),
         "epochs_completed": int(trainer.current_epoch),
         "pretrained_checkpoint": str(pretrained_checkpoint) if pretrained_checkpoint else None,
+        "resumed_from_checkpoint": str(resume_checkpoint) if resume_checkpoint else None,
     }
     return best_model, metadata
 
@@ -329,6 +444,13 @@ def predict_long(
                 "solar_elevation": target["solar_elevation"],
                 "point_forecast": float(point[sample, step]),
             }
+            for weather_column in (
+                "weather_available",
+                "weather_issue_timestamp_available",
+                "weather_lead_hours",
+            ):
+                if weather_column in target:
+                    row[weather_column] = float(target[weather_column])
             for index, quantile in enumerate(QUANTILES):
                 row[f"q{int(quantile * 100):02d}"] = float(quantiles[sample, step, index])
             rows.append(row)
@@ -343,6 +465,7 @@ def save_model_bundle(
     metadata: dict[str, Any],
     source_hashes: dict[str, str],
     capacity_metadata: dict[str, float] | None = None,
+    dataset_path: Path | None = None,
 ) -> None:
     import torch
 
@@ -355,7 +478,8 @@ def save_model_bundle(
         "config": asdict(config),
         "features": {
             "known_reals": list(KNOWN_REALS)
-            + (list(SATELLITE_REALS) if config.satellite_enabled else []),
+            + (list(SATELLITE_REALS) if config.satellite_enabled else [])
+            + (list(WEATHER_REALS) if config.weather_enabled else []),
             "static_reals": list(STATIC_REALS),
             "targets": list(TARGETS),
             "site_id_is_model_feature": False,
@@ -363,6 +487,7 @@ def save_model_bundle(
         },
         "training": metadata,
         "source_hashes": source_hashes,
+        "dataset_path": str(dataset_path.resolve()) if dataset_path is not None else None,
         "capacity_metadata_mw": capacity_metadata or {},
         "dependencies": dependency_versions(),
         "platform": platform.platform(),

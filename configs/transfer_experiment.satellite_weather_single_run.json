@@ -1,0 +1,30 @@
+{
+  "schema_version": "transfer-experiment-v2",
+  "paths": {
+    "slovenian_dataset": "outputs/transfer_experiment_satellite_pilot/prepared_satellite/slovenia.parquet",
+    "finnish_dataset": "outputs/transfer_experiment_satellite_pilot/prepared_satellite/finnish.parquet",
+    "output_root": "outputs/transfer_experiment_satellite_weather_single_run",
+    "slovenian_checkpoint_root": "models/tft_slovenia_satellite_weather_single_run",
+    "fold_model_root": "models/tft_finnish_folds_satellite_weather_single_run",
+    "final_model_root": "models/tft_finnish_final_satellite_weather_single_run"
+  },
+  "weather": {
+    "enabled": true,
+    "provider": "open-meteo",
+    "mode": "single_run",
+    "model": "ecmwf_ifs025",
+    "forecast_days": 10,
+    "cache_dir": "data/cache/openmeteo-single-runs"
+  },
+  "tft": {
+    "point_loss": "mae-heavy",
+    "batch_size": 64,
+    "max_epochs": 50,
+    "max_sequences_per_epoch": 10000,
+    "patience": 5,
+    "learning_rate": 0.0001,
+    "weather_enabled": true,
+    "satellite_enabled": true,
+    "satellite_encoder_only": true
+  }
+}

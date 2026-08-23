@@ -17,9 +17,12 @@ from aurora.forecasting.baselines import (
     enforce_monotonic_quantiles,
 )
 from aurora.forecasting.tft_transfer import (
+    PHYSICAL_CONTEXT_REALS,
+    SATELLITE_REALS,
     TFTTransferConfig,
     create_dataset,
     fit_tft,
+    prepare_tft_frame,
     predict_long,
     save_model_bundle,
 )
@@ -53,6 +56,20 @@ def test_smart_persistence_is_train_only_and_finite() -> None:
     assert model.fitted_through == timestamps[79]
     assert np.isfinite(forecasts["smart_persistence"]).all()
     assert len(forecasts) == 8
+
+
+def test_physical_context_is_observed_only_and_clipped() -> None:
+    frame = _site_frame("physical", 46.0)
+    frame["capacity_factor"] = [0.2, np.nan, 1.4, 0.5] + [0.0] * (len(frame) - 4)
+    frame["observation_available"] = [True, False, True, True] + [True] * (len(frame) - 4)
+    frame["clear_sky_norm"] = 0.5
+    prepared = prepare_tft_frame(frame, TFTTransferConfig())
+    assert set(PHYSICAL_CONTEXT_REALS).issubset(prepared.columns)
+    assert prepared.loc[0, "observed_capacity_factor"] == pytest.approx(0.2)
+    assert prepared.loc[0, "clear_sky_index"] == pytest.approx(0.4)
+    assert prepared.loc[1, "clear_sky_index_available"] == 0.0
+    assert prepared.loc[1, "clear_sky_index"] == 0.0
+    assert prepared.loc[2, "clear_sky_index"] == 1.0
 
 
 def test_common_mask_fails_on_missing_eligible_prediction() -> None:
@@ -217,6 +234,21 @@ def test_synthetic_multisite_pretrain_reload_and_unseen_site_finetune(tmp_path: 
     assert (np.diff(predictions[quantile_columns], axis=1) >= 0).all()
     assert (tmp_path / "bundle" / "manifest.json").exists()
     assert (tmp_path / "bundle" / "dataset_parameters.pt").exists()
+
+
+def test_satellite_features_are_encoder_only_unknown_reals() -> None:
+    pytest.importorskip("pytorch_forecasting")
+    frame = _site_frame("si-satellite", 46.0)
+    for column in SATELLITE_REALS:
+        frame[column] = 0.0
+    config = TFTTransferConfig(
+        accelerator="cpu", satellite_enabled=True, satellite_encoder_only=True
+    )
+
+    dataset = create_dataset(frame, config)
+
+    assert set(SATELLITE_REALS) <= set(dataset.time_varying_unknown_reals)
+    assert set(SATELLITE_REALS).isdisjoint(dataset.time_varying_known_reals)
 
 
 def _site_frame(
