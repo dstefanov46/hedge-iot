@@ -1,5 +1,5 @@
-from datetime import UTC, datetime, timedelta
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from aurora.satellite import batch as satellite_batch
+from aurora.satellite import slovenian as slovenian_satellite
 from aurora.satellite.acquisition import (
     EumetsatClient,
     coverage_report,
@@ -15,7 +17,6 @@ from aurora.satellite.acquisition import (
     download_products,
     validate_native_archive,
 )
-from aurora.satellite import batch as satellite_batch
 from aurora.satellite.config import CHANNEL_NAMES, SatelliteConfig, SiteConfig
 from aurora.satellite.embedding import FrozenCNNEncoder
 from aurora.satellite.features import align_satellite_features, derive_patch_features
@@ -82,6 +83,61 @@ def test_alignment_is_backward_only_and_tolerant():
     )
     result = align_satellite_features(frame, satellite)
     assert result["satellite_missing"].tolist() == [0.1, 0.2]
+
+
+def test_alignment_accepts_mixed_iso_precision_and_causal_scan_lag():
+    frame = pd.DataFrame(
+        {
+            "site_id": ["s", "s"],
+            "timestamp_utc": ["2025-01-01T00:00:00Z", "2025-01-01T00:15:00Z"],
+        }
+    )
+    satellite = pd.DataFrame(
+        {
+            "site_id": ["s"],
+            "timestamp_utc": ["2025-01-01T00:00:10.656000+00:00"],
+            "satellite_missing": [0.0],
+        }
+    )
+
+    result = align_satellite_features(frame, satellite, tolerance_minutes=15.0)
+
+    assert result["satellite_sensing_timestamp_utc"].isna().iloc[0]
+    assert result["satellite_sensing_timestamp_utc"].notna().iloc[1]
+
+
+def test_slovenian_iterator_decodes_each_archive_once(tmp_path, monkeypatch):
+    for stamp in ("202201010000", "202201010015"):
+        folder = tmp_path / stamp
+        folder.mkdir()
+        (folder / f"15_{stamp}.zarr.zip").write_bytes(b"")
+        (folder / f"15_hrv_{stamp}.zarr.zip").write_bytes(b"")
+
+    calls = []
+
+    def fake_read(archive):
+        calls.append(archive.timestamp_utc)
+        lat = np.repeat(np.linspace(45, 47, 80)[:, None], 80, axis=1)
+        lon = np.repeat(np.linspace(13, 17, 80)[None, :], 80, axis=0)
+        return {
+            **{name: np.ones((80, 80), dtype=np.float32) for name in CHANNEL_NAMES},
+            "__lat": lat,
+            "__lon": lon,
+        }
+
+    monkeypatch.setattr(slovenian_satellite, "read_archive", fake_read)
+    sites = pd.DataFrame(
+        {
+            "site_id": ["a", "b"],
+            "latitude": [46.0, 46.1],
+            "longitude": [14.0, 15.0],
+        }
+    )
+
+    records = list(slovenian_satellite.iter_site_patches(tmp_path, sites))
+
+    assert len(records) == 4
+    assert len(calls) == 2
 
 
 def test_download_is_idempotent_and_writes_checksum(tmp_path):

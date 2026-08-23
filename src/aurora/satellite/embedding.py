@@ -15,7 +15,7 @@ def _load_patch(path: str | Path) -> np.ndarray:
 class FrozenCNNEncoder:
     """Two-block CNN encoder with a deterministic fallback for minimal installs."""
 
-    version = "frozen-cnn-v1"
+    version = "frozen-cnn-v2"
 
     def __init__(self, embedding_dim: int = 32, seed: int = 42):
         self.embedding_dim, self.seed = embedding_dim, seed
@@ -58,17 +58,34 @@ class FrozenCNNEncoder:
         torch = self._torch
         torch.manual_seed(self.seed)
         self.model.train()
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(device)
+        # Predict channel-level moments as a compact self-supervised task. This
+        # avoids the previous output-to-zero objective, which encouraged a
+        # collapsed embedding and did not learn image content.
+        predictor = torch.nn.Linear(self.embedding_dim, 24).to(device)
+        optimizer = torch.optim.Adam(
+            [*self.model.parameters(), *predictor.parameters()], lr=learning_rate
+        )
         inputs = torch.from_numpy(values)
+        targets = torch.from_numpy(
+            np.concatenate(
+                [values.mean(axis=(2, 3)), values.std(axis=(2, 3))], axis=1
+            ).astype(np.float32)
+        )
+        generator = torch.Generator().manual_seed(self.seed)
         for _ in range(max(1, epochs)):
-            optimizer.zero_grad()
-            output = self.model(inputs)
-            # A stable self-supervised objective keeps this utility usable without labels.
-            loss = (output**2).mean()
-            if len(values) > 1:
-                loss = loss + 0.01 * (output[1:] - output[:-1]).pow(2).mean()
-            loss.backward()
-            optimizer.step()
+            order = torch.randperm(len(inputs), generator=generator)
+            for offset in range(0, len(inputs), 64):
+                indices = order[offset : offset + 64]
+                batch = inputs[indices].to(device)
+                target = targets[indices].to(device)
+                optimizer.zero_grad()
+                embedding = self.model(batch)
+                loss = torch.nn.functional.mse_loss(predictor(embedding), target)
+                loss.backward()
+                optimizer.step()
+        self.model.to("cpu")
         self.freeze()
         return self
 
@@ -121,6 +138,30 @@ class FrozenCNNEncoder:
             with self._torch.no_grad():
                 return self.model(self._torch.from_numpy(values[None])).numpy()[0]
         return values.mean(axis=(1, 2)) @ self._projection
+
+    def encode_batch(
+        self, patches: np.ndarray, *, batch_size: int = 256, use_cuda: bool = True
+    ) -> np.ndarray:
+        """Encode a bounded batch without retaining model activations."""
+        values = np.nan_to_num(np.asarray(patches, dtype=np.float32), nan=0.0)
+        if values.ndim != 4 or values.shape[1:] != (12, 64, 64):
+            raise ValueError("encoder expects patches with shape (n, 12, 64, 64)")
+        if self.model is None:
+            return values.mean(axis=(2, 3)) @ self._projection
+        torch = self._torch
+        device = torch.device(
+            "cuda" if use_cuda and torch.cuda.is_available() else "cpu"
+        )
+        self.model.to(device).eval()
+        encoded = []
+        with torch.no_grad():
+            for offset in range(0, len(values), batch_size):
+                batch = torch.from_numpy(values[offset : offset + batch_size]).to(device)
+                encoded.append(self.model(batch).cpu().numpy())
+        self.model.to("cpu")
+        return np.concatenate(encoded, axis=0) if encoded else np.empty(
+            (0, self.embedding_dim), dtype=np.float32
+        )
 
     def metadata(self) -> dict[str, object]:
         return {

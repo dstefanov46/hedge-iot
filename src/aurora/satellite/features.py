@@ -57,8 +57,13 @@ def align_satellite_features(
         raise ValueError("both frames require site_id and timestamp_utc")
     left = frame.copy()
     right = satellite.copy()
-    left["timestamp_utc"] = pd.to_datetime(left["timestamp_utc"], utc=True)
-    right["timestamp_utc"] = pd.to_datetime(right["timestamp_utc"], utc=True)
+    timestamp_dtype = "datetime64[ns, UTC]"
+    left["timestamp_utc"] = pd.to_datetime(
+        left["timestamp_utc"], format="mixed", utc=True
+    ).astype(timestamp_dtype)
+    right["timestamp_utc"] = pd.to_datetime(
+        right["timestamp_utc"], format="mixed", utc=True
+    ).astype(timestamp_dtype)
     right["satellite_sensing_timestamp_utc"] = right["timestamp_utc"]
     if issue_time is not None:
         cutoff = pd.Timestamp(issue_time)

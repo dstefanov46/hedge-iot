@@ -1,15 +1,15 @@
 {
   "schema_version": "transfer-experiment-v2",
   "paths": {
-    "slovenian_dataset": "data/processed/slovenia.parquet",
+    "slovenian_dataset": "outputs/satellite_pilot_input/slovenia_30sites.parquet",
     "finnish_dataset": "data/processed/hirvensalmi.parquet",
-    "output_root": "outputs/transfer_experiment_satellite_v1",
-    "slovenian_checkpoint_root": "models/tft_slovenia_satellite_v1",
-    "fold_model_root": "models/tft_finnish_folds_satellite_v1",
-    "final_model_root": "models/tft_finnish_final_satellite_v1"
+    "output_root": "outputs/transfer_experiment_satellite_pilot",
+    "slovenian_checkpoint_root": "models/tft_slovenia_satellite_pilot",
+    "fold_model_root": "models/tft_finnish_folds_satellite_pilot",
+    "final_model_root": "models/tft_finnish_final_satellite_pilot"
   },
   "source_hashes": {},
-  "bootstrap_replicates": 100,
+  "bootstrap_replicates": 20,
   "bootstrap_block_length": 15,
   "skill_threshold": 0.10,
   "satellite": {
@@ -17,8 +17,8 @@
     "embedding_dim": 32,
     "encoder_only": true,
     "slovenian_zarr_root": "F:/MAG/satip_home_dir2/sat_images/zarr_files",
-    "finnish_patch_root": "C:/Users/dimit/hedge-iot-sat-data/hedge-iot/data/processed/satellite/physical_patches",
-    "encoder_checkpoint": "models/tft_slovenia_satellite_v1/satellite_encoder.pt",
+    "finnish_patch_root": "C:/Users/dimit/hedge-iot-sat-data/hedge-iot/data/backup/satellite/processed/physical_patches",
+    "encoder_checkpoint": "models/tft_slovenian_satellite_pilot/satellite_encoder.pt",
     "max_training_patches": 4096,
     "training_end": "2023-01-01T23:45:00Z",
     "missing_value": 0.0,
@@ -32,11 +32,11 @@
     "hidden_continuous_size": 8,
     "dropout": 0.1,
     "batch_size": 128,
-    "max_epochs": 50,
-    "patience": 5,
+    "max_epochs": 5,
+    "patience": 2,
     "learning_rate": 0.0001,
     "gradient_clip_val": 0.1,
-    "max_sequences_per_epoch": 10000,
+    "max_sequences_per_epoch": 3000,
     "random_seed": 42,
     "accelerator": "cuda",
     "num_workers": 0
