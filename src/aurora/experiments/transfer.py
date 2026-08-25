@@ -26,6 +26,8 @@ from aurora.evaluation.transfer import (
 )
 from aurora.forecasting.baselines import HarmonicSmartPersistence, PhysicalSmartPersistence
 from aurora.forecasting.tft_transfer import (
+    WEATHER_MASK_REALS,
+    WEATHER_REALS,
     TFTTransferConfig,
     assert_usable_weather,
     create_dataset,
@@ -53,6 +55,7 @@ class TransferExperimentConfig:
     skill_threshold: float = 0.10
     satellite: dict[str, object] | None = None
     weather: dict[str, object] | None = None
+    fold_ids: tuple[int, ...] | None = None
 
     @classmethod
     def from_json(cls, path: Path) -> TransferExperimentConfig:
@@ -85,6 +88,7 @@ class TransferExperimentConfig:
             skill_threshold=float(values.get("skill_threshold", 0.10)),
             satellite=values.get("satellite"),
             weather=values.get("weather"),
+            fold_ids=tuple(int(x) for x in values.get("fold_ids", [])) or None,
         )
 
 
@@ -103,7 +107,10 @@ def _satellite_tft_values(values: dict[str, object] | None) -> dict[str, object]
 def _weather_tft_values(values: dict[str, object] | None) -> dict[str, object]:
     if not values or not bool(values.get("enabled", False)):
         return {}
-    return {"weather_enabled": True}
+    return {
+        "weather_enabled": True,
+        "weather_feature_preset": str(values.get("feature_preset", "full")),
+    }
 
 
 def pretrain_slovenian_tft(
@@ -115,7 +122,7 @@ def pretrain_slovenian_tft(
     resume_checkpoint: Path | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     frame = read_processed_dataset(dataset_path)
-    if config.weather_enabled:
+    if config.weather_features():
         assert_usable_weather(frame)
     source_hashes = source_hashes or _manifest_source_hashes(dataset_path)
     validation_start = frame["timestamp_utc"].max() - pd.Timedelta(days=validation_days)
@@ -546,6 +553,15 @@ def run_transfer_experiment(config_path: Path) -> dict[str, Any]:
         experiment.bootstrap_block_length,
         experiment.skill_threshold,
         experiment_schema=experiment.schema_version,
+        folds=(
+            [
+                fold
+                for fold in generate_expanding_finnish_folds()
+                if fold.fold_id in experiment.fold_ids
+            ]
+            if experiment.fold_ids is not None
+            else None
+        ),
     )
     final = fit_final_finnish_checkpoint(
         experiment.finnish_dataset,
@@ -587,6 +603,14 @@ def _prepare_weather_frames(experiment: TransferExperimentConfig) -> TransferExp
         "license": "CC BY 4.0",
         "cache_dir": str(cache_dir),
         "sites": {},
+        "canonical_units": {
+            "temperature": "degC", "dew_point": "degC", "wind_speed": "m/s",
+            "precipitation": "mm", "shortwave_radiation": "W/m2",
+            "surface_pressure": "hPa", "low_cloud_cover": "%", "relative_humidity": "%",
+        },
+        "availability_delay_hours": float(values.get("availability_delay_hours", 6.0)),
+        "conservative_row_cutoff_hours": float(values.get("conservative_cutoff_hours", 2.0)),
+        "feature_preset": str(values.get("feature_preset", "full")),
     }
     if provider in {"ecmwf-grib", "grib", "nwp"}:
         slovenia_frame = read_processed_dataset(experiment.slovenian_dataset)
@@ -599,7 +623,20 @@ def _prepare_weather_frames(experiment: TransferExperimentConfig) -> TransferExp
             site_rows,
             slovenia_frame["timestamp_utc"],
             checkpoint_root=prepared_root / "grib_checkpoints",
+            availability_delay_hours=float(values.get("availability_delay_hours", 6.0)),
+            conservative_cutoff_hours=float(values.get("conservative_cutoff_hours", 2.0)),
         )
+        if not grib_manifest.get("source_files"):
+            raise FileNotFoundError(
+                "No GRIB source files were found for the Slovenian weather run. "
+                f"Check weather.archive_root={grib_root!s} and ensure the NWP archive "
+                "contains NWP_data_<variable>/*.grib files."
+            )
+        if not grib_manifest.get("issue_time_coverage", {}).get("rows", 0):
+            raise RuntimeError(
+                "GRIB files were found, but no operationally available weather rows "
+                "survived the issue-time and availability-delay filters."
+            )
         weather_manifest.update(grib_manifest)
         weather_manifest["sites"] = {
             str(site.site_id): {
@@ -639,6 +676,8 @@ def _prepare_weather_frames(experiment: TransferExperimentConfig) -> TransferExp
                     target_timestamps=group["timestamp_utc"],
                     model=model,
                     forecast_days=int(values.get("forecast_days", 10)),
+                    availability_delay_hours=float(values.get("availability_delay_hours", 6.0)),
+                    conservative_cutoff_hours=float(values.get("conservative_cutoff_hours", 2.0)),
                 )
                 weather_manifest["sites"][str(site_id)] = {
                     "latitude": latitude,
@@ -661,21 +700,7 @@ def _prepare_weather_frames(experiment: TransferExperimentConfig) -> TransferExp
                 parsed = pd.DataFrame(
                     {"site_id": str(site_id), "timestamp_utc": group["timestamp_utc"]}
                 )
-                for column in (
-                    "weather_temperature_2m",
-                    "weather_relative_humidity_2m",
-                    "weather_dew_point_2m",
-                    "weather_wind_speed_10m",
-                    "weather_wind_direction_10m",
-                    "weather_cloud_cover",
-                    "weather_low_cloud_cover",
-                    "weather_precipitation",
-                    "weather_shortwave_radiation",
-                    "weather_surface_pressure",
-                    "weather_available",
-                    "weather_issue_timestamp_available",
-                    "weather_lead_hours",
-                ):
+                for column in (*WEATHER_REALS, *WEATHER_MASK_REALS):
                     parsed[column] = 0.0
                 parsed["weather_provider"] = "open-meteo"
                 parsed["weather_model"] = model

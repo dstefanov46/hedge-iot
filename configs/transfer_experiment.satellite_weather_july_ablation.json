@@ -1,0 +1,39 @@
+{
+  "schema_version": "transfer-experiment-v2",
+  "fold_ids": [2],
+  "paths": {
+    "slovenian_dataset": "outputs/transfer_experiment_satellite_pilot/prepared_satellite/slovenia.parquet",
+    "finnish_dataset": "outputs/transfer_experiment_satellite_pilot/prepared_satellite/finnish.parquet",
+    "output_root": "outputs/transfer_experiment_satellite_weather_july_ablation",
+    "slovenian_checkpoint_root": "models/tft_slovenia_satellite_weather_july_ablation",
+    "fold_model_root": "models/tft_finnish_folds_satellite_weather_july_ablation",
+    "final_model_root": "models/tft_finnish_final_satellite_weather_july_ablation"
+  },
+  "weather": {
+    "enabled": true,
+    "provider": "ecmwf-grib",
+    "feature_preset": "full",
+    "availability_delay_hours": 6,
+    "conservative_cutoff_hours": 2,
+    "archive_root": "F:/MAG/nwp_data",
+    "mode": "single_run",
+    "model": "ecmwf_ifs025",
+    "cache_dir": "data/cache/openmeteo-single-runs"
+  },
+  "tft": {
+    "point_loss": "mae-heavy",
+    "batch_size": 64,
+    "max_sequences_per_epoch": 10000,
+    "patience": 5,
+    "accelerator": "cuda",
+    "satellite_enabled": true,
+    "satellite_encoder_only": true
+  },
+  "ablation": {
+    "presets": ["none", "radiation", "radiation_low_cloud", "full"],
+    "run_transfer": true,
+    "run_scratch": true,
+    "run_physical_smart_persistence": true,
+    "full_eight_fold_gate": "proceed only after July RMSE improvement and timing validation"
+  }
+}
