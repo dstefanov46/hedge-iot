@@ -30,6 +30,56 @@ GRIB_VARIABLES = {
     "lcc": "weather_low_cloud_cover",
 }
 ACCUMULATED = {"tp", "ssrd"}
+GRIB_CANONICAL_UNITS = {
+    "temperature": "degC",
+    "dew_point": "degC",
+    "wind_speed": "m/s",
+    "precipitation": "mm",
+    "shortwave_radiation": "W/m2",
+    "surface_pressure": "hPa",
+    "low_cloud_cover": "%",
+    "relative_humidity": "%",
+}
+
+
+def kelvin_to_celsius(values: Any) -> np.ndarray:
+    return np.asarray(values, dtype=float) - 273.15
+
+
+def pascal_to_hpa(values: Any) -> np.ndarray:
+    return np.asarray(values, dtype=float) / 100.0
+
+
+def metres_to_mm(values: Any) -> np.ndarray:
+    return np.asarray(values, dtype=float) * 1000.0
+
+
+def fraction_to_percent(values: Any) -> np.ndarray:
+    return np.asarray(values, dtype=float) * 100.0
+
+
+def accumulated_energy_to_wm2(
+    values: Any, valid_times: Any, groups: Iterable[Any] | None = None
+) -> np.ndarray:
+    """Convert independently de-accumulated J/m2 values to interval-average W/m2."""
+    group_values = None if groups is None else list(groups)
+    energy = deaccumulate(values, group_values)
+    times = pd.DatetimeIndex(pd.to_datetime(valid_times, utc=True))
+    if groups is None:
+        groups = np.zeros(len(times), dtype=int)
+    else:
+        groups = group_values
+    group = np.asarray(list(groups))
+    hours = np.ones(len(times), dtype=float)
+    for key in pd.unique(group):
+        indices = np.flatnonzero(group == key)
+        for position, index in enumerate(indices):
+            if position:
+                hours[index] = max(
+                    (times[index] - times[indices[position - 1]]).total_seconds() / 3600,
+                    1e-9,
+                )
+    return energy / (hours * 3600.0)
 
 
 def valid_time_from_issue_step(
@@ -256,8 +306,13 @@ def _point_records(dataset: Any, variable: str, sites: pd.DataFrame) -> pd.DataF
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def _process_grib_chunk(records: list[pd.DataFrame], target_index: pd.DatetimeIndex,
-                        accumulator: pd.DataFrame) -> None:
+def _process_grib_chunk(
+    records: list[pd.DataFrame],
+    target_index: pd.DatetimeIndex,
+    accumulator: pd.DataFrame,
+    availability_delay_hours: float = 6.0,
+    conservative_cutoff_hours: float = 2.0,
+) -> None:
     """Merge one month/stream into the target-sized accumulator in place."""
     if not records:
         return
@@ -270,12 +325,17 @@ def _process_grib_chunk(records: list[pd.DataFrame], target_index: pd.DatetimeIn
     for variable in GRIB_VARIABLES:
         if variable not in wide:
             wide[variable] = np.nan
-    for variable in ACCUMULATED:
+    groups = wide["site_id"].astype(str) + "|" + wide["issue_timestamp_utc"].astype(str)
+    for variable in (ACCUMULATED - {"ssrd"}):
         wide[variable] = wide.groupby(
             ["site_id", "issue_timestamp_utc"], sort=False, group_keys=False
-        )[variable].transform(
-            lambda series: deaccumulate(series.to_numpy())
-        )
+        )[variable].transform(lambda series: deaccumulate(series.to_numpy()))
+    wide["t2m"] = kelvin_to_celsius(wide.t2m)
+    wide["d2m"] = kelvin_to_celsius(wide.d2m)
+    wide["tp"] = metres_to_mm(wide.tp)
+    wide["sp"] = pascal_to_hpa(wide.sp)
+    wide["ssrd"] = accumulated_energy_to_wm2(wide.ssrd, wide.valid_time_utc, groups)
+    wide["lcc"] = fraction_to_percent(wide.lcc)
     wide["weather_temperature_2m"] = wide.t2m
     wide["weather_dew_point_2m"] = wide.d2m
     wide["weather_precipitation"] = wide.tp
@@ -296,7 +356,8 @@ def _process_grib_chunk(records: list[pd.DataFrame], target_index: pd.DatetimeIn
     for (site_id, issue), group in wide.groupby(["site_id", "issue_timestamp_utc"], sort=False):
         issue = pd.Timestamp(issue)
         eligible = target_index[
-            (target_index > issue) & (target_index <= issue + pd.Timedelta(hours=12))
+            (target_index >= issue + pd.Timedelta(hours=availability_delay_hours))
+            & (target_index <= issue + pd.Timedelta(hours=12))
         ]
         if len(eligible) == 0:
             continue
@@ -380,6 +441,8 @@ def read_grib_weather_archive(
     sites: pd.DataFrame,
     targets: Any,
     checkpoint_root: str | Path | None = None,
+    availability_delay_hours: float = 6.0,
+    conservative_cutoff_hours: float = 2.0,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Read the archive incrementally, retaining only requested points and targets.
 
@@ -448,7 +511,13 @@ def read_grib_weather_archive(
                 f"in {time.perf_counter() - file_started:.1f}s",
                 flush=True,
             )
-        _process_grib_chunk(records, target_index, accumulator)
+        _process_grib_chunk(
+            records,
+            target_index,
+            accumulator,
+            availability_delay_hours,
+            conservative_cutoff_hours,
+        )
         completed.add(chunk_key)
         if checkpoint_path is not None:
             _save_grib_checkpoint(
@@ -478,19 +547,21 @@ def read_grib_weather_archive(
         result["weather_issue_timestamp_available"] = (
             result["weather_forecast_reference_utc"].notna().astype(float)
         )
+        physical_columns = output_columns + [
+            "weather_relative_humidity_2m",
+            "weather_wind_speed_10m",
+            "weather_wind_direction_10m",
+        ]
         result["weather_available"] = (
             result[
-                output_columns
-                + [
-                    "weather_relative_humidity_2m",
-                    "weather_wind_speed_10m",
-                    "weather_wind_direction_10m",
-                ]
+                physical_columns
             ]
             .notna()
             .any(axis=1)
             .astype(float)
         )
+        for column in physical_columns:
+            result[f"{column}_available"] = result[column].notna().astype(float)
         result["weather_provider"], result["weather_model"] = "ecmwf-grib", "ecmwf-ifs"
     request_files = list(Path(root).glob("NWP_data_*/*.req"))
     all_files = sorted(set(source_files + request_files))
@@ -506,9 +577,12 @@ def read_grib_weather_archive(
         "source_files": [str(x) for x in all_files],
         "source_hashes": {str(x): sha256_file(x) for x in all_files},
         "variable_mappings": GRIB_VARIABLES,
+        "canonical_units": GRIB_CANONICAL_UNITS,
         "streams": ["oper", "scda"],
         "issue_cycles_utc": ["00:00", "06:00", "12:00", "18:00"],
         "forecast_horizon_hours": 12,
+        "availability_delay_hours": availability_delay_hours,
+        "conservative_row_cutoff_hours": conservative_cutoff_hours,
         "deaccumulation": "per issue/reference time; negative resets clamped to zero",
         "total_cloud": "masked; lcc is exposed only as weather_low_cloud_cover",
         "missing_variable_counts": missing_counts,

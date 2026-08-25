@@ -30,6 +30,7 @@ HOURLY_VARIABLES = (
     "wind_speed_10m",
     "wind_direction_10m",
     "cloud_cover",
+    "cloud_cover_low",
     "precipitation",
     "shortwave_radiation",
     "surface_pressure",
@@ -49,7 +50,22 @@ WEATHER_REALS = (
     "weather_issue_timestamp_available",
     "weather_lead_hours",
 )
-_COLUMN_MAP = {name: f"weather_{name}" for name in HOURLY_VARIABLES}
+WEATHER_PHYSICAL_REALS = tuple(
+    column for column in WEATHER_REALS if column.startswith("weather_")
+    and column
+    not in {"weather_available", "weather_issue_timestamp_available", "weather_lead_hours"}
+)
+WEATHER_MASKS = tuple(f"{column}_available" for column in WEATHER_PHYSICAL_REALS)
+CANONICAL_WEATHER_UNITS = {
+    "temperature_2m": "degC", "relative_humidity_2m": "%", "dew_point_2m": "degC",
+    "wind_speed_10m": "m/s", "wind_direction_10m": "deg", "precipitation": "mm",
+    "shortwave_radiation": "W/m2", "surface_pressure": "hPa",
+    "cloud_cover_low": "%", "cloud_cover": "% (masked compatibility only)",
+}
+_COLUMN_MAP = {
+    name: ("weather_low_cloud_cover" if name == "cloud_cover_low" else f"weather_{name}")
+    for name in HOURLY_VARIABLES
+}
 
 
 @dataclass(frozen=True)
@@ -73,6 +89,11 @@ class OpenMeteoRequest:
             "latitude": f"{self.latitude:.6f}",
             "longitude": f"{self.longitude:.6f}",
             "hourly": ",".join(HOURLY_VARIABLES),
+            "temperature_unit": "celsius",
+            "wind_speed_unit": "ms",
+            "precipitation_unit": "mm",
+            "shortwave_radiation_unit": "watt_per_square_meter",
+            "surface_pressure_unit": "hPa",
             "timezone": "UTC",
             "models": api_model,
         }
@@ -221,7 +242,8 @@ def parse_openmeteo_response(
     # Open-Meteo's standard response currently provides total cloud cover;
     # keep the explicit low-cloud field for the shared TFT schema without
     # confusing total cloud cover with low cloud cover.
-    out["weather_low_cloud_cover"] = np.nan
+    # Total cloud is deliberately masked: Slovenian GRIB only supplies low cloud.
+    out["weather_cloud_cover"] = np.nan
     out["weather_provider"] = provider
     out["weather_model"] = payload.get("model") or model
     out["weather_forecast_reference_utc"] = issue_ts
@@ -230,7 +252,9 @@ def parse_openmeteo_response(
         out["weather_lead_hours"] = (out["timestamp_utc"] - issue_ts).dt.total_seconds() / 3600
     else:
         out["weather_lead_hours"] = np.nan
-    out["weather_available"] = out[list(_COLUMN_MAP.values())].notna().any(axis=1).astype(float)
+    for column in WEATHER_PHYSICAL_REALS:
+        out[f"{column}_available"] = out[column].notna().astype(float)
+    out["weather_available"] = out[list(WEATHER_PHYSICAL_REALS)].notna().any(axis=1).astype(float)
     return out
 
 
@@ -250,7 +274,7 @@ def resample_weather_to_grid(
         .set_index("timestamp_utc")
     )
     grid = pd.DatetimeIndex(pd.to_datetime(timestamps, utc=True))
-    numeric = [c for c in WEATHER_REALS if c in source]
+    numeric = [c for c in (*WEATHER_REALS, *WEATHER_MASKS) if c in source]
     metadata = [
         c
         for c in ("weather_provider", "weather_model", "weather_forecast_reference_utc")
@@ -261,7 +285,7 @@ def resample_weather_to_grid(
     if metadata:
         result[metadata] = result[metadata].ffill()
     result = result.reindex(grid).reset_index(names="timestamp_utc")
-    for column in ("weather_issue_timestamp_available", "weather_available"):
+    for column in (*WEATHER_MASKS, "weather_issue_timestamp_available", "weather_available"):
         if column in result:
             result[column] = result[column].fillna(0.0)
     return result
@@ -300,6 +324,8 @@ def fetch_single_run_weather_archive(
     model: str = OPEN_METEO_MODEL,
     forecast_days: int = 10,
     run_hours: tuple[int, ...] = (0, 6, 12, 18),
+    availability_delay_hours: float = 6.0,
+    conservative_cutoff_hours: float = 2.0,
 ) -> pd.DataFrame:
     """Fetch exact model runs and select the latest eligible run per target."""
     targets = pd.DatetimeIndex(pd.to_datetime(target_timestamps, utc=True)).sort_values().unique()
@@ -348,12 +374,15 @@ def fetch_single_run_weather_archive(
         aligned["site_id"] = site_id
         issue = request.run_timestamp_utc
         lead = (aligned["timestamp_utc"] - issue).dt.total_seconds() / 3600
-        valid = (aligned["timestamp_utc"] > issue) & (lead <= forecast_days * 24)
+        valid = (
+            aligned["timestamp_utc"]
+            >= issue + pd.Timedelta(hours=availability_delay_hours)
+        ) & (lead <= forecast_days * 24)
         aligned.loc[:, "weather_lead_hours"] = lead
         candidates.append(aligned.loc[valid].copy())
     if not candidates:
         result = pd.DataFrame({"site_id": site_id, "timestamp_utc": targets})
-        for column in WEATHER_REALS:
+        for column in (*WEATHER_REALS, *WEATHER_MASKS):
             if column not in result:
                 result[column] = np.nan
         return result
@@ -394,3 +423,30 @@ def validate_weather_forecast_windows(windows: pd.DataFrame) -> None:
         != pd.Timedelta(0)
     ).any():
         raise ValueError("Weather target timestamps are not aligned to 15 minutes")
+
+
+def validate_operational_weather_availability(
+    windows: pd.DataFrame,
+    *,
+    availability_delay_hours: float = 6.0,
+    conservative_cutoff_hours: float = 2.0,
+) -> None:
+    """Validate weather availability against target and PV issue timestamps."""
+    validate_weather_forecast_windows(windows)
+    issue = pd.to_datetime(windows["weather_forecast_reference_utc"], utc=True)
+    target = pd.to_datetime(windows["target_timestamp_utc"], utc=True)
+    known = issue.notna()
+    if (
+        target[known]
+        < issue[known] + pd.Timedelta(hours=availability_delay_hours)
+    ).any():
+        raise ValueError("Weather row is used before the availability delay has elapsed")
+    pv_column = "pv_forecast_issue_timestamp_utc"
+    if pv_column in windows:
+        pv_issue = pd.to_datetime(windows[pv_column], utc=True)
+        comparable = known & pv_issue.notna()
+        if (
+            issue[comparable]
+            > pv_issue[comparable] - pd.Timedelta(hours=conservative_cutoff_hours)
+        ).any():
+            raise ValueError("Weather forecast run was issued after the conservative PV cutoff")

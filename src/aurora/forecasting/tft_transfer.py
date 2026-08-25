@@ -52,6 +52,18 @@ WEATHER_REALS = (
     "weather_issue_timestamp_available",
     "weather_lead_hours",
 )
+WEATHER_PHYSICAL_REALS = (
+    "weather_temperature_2m", "weather_relative_humidity_2m", "weather_dew_point_2m",
+    "weather_wind_speed_10m", "weather_wind_direction_10m", "weather_low_cloud_cover",
+    "weather_precipitation", "weather_shortwave_radiation", "weather_surface_pressure",
+)
+WEATHER_MASK_REALS = tuple(f"{column}_available" for column in WEATHER_PHYSICAL_REALS)
+WEATHER_FEATURE_PRESETS = {
+    "none": (),
+    "radiation": ("weather_shortwave_radiation",),
+    "radiation_low_cloud": ("weather_shortwave_radiation", "weather_low_cloud_cover"),
+    "full": WEATHER_PHYSICAL_REALS,
+}
 TARGETS = ("target_point", "target_quantiles")
 
 
@@ -82,11 +94,29 @@ class TFTTransferConfig:
     satellite_max_alignment_minutes: float = 7.5
     point_loss: str = "mse"
     weather_enabled: bool = False
+    weather_feature_preset: str = "full"
+
+    def weather_features(self) -> tuple[str, ...]:
+        if not self.weather_enabled:
+            return ()
+        try:
+            return WEATHER_FEATURE_PRESETS[self.weather_feature_preset]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unknown weather_feature_preset {self.weather_feature_preset!r}; "
+                f"choose from {', '.join(WEATHER_FEATURE_PRESETS)}"
+            ) from exc
 
 
 def prepare_tft_frame(frame: pd.DataFrame, config: TFTTransferConfig) -> pd.DataFrame:
     satellite_columns = set(SATELLITE_REALS) if config.satellite_enabled else set()
-    weather_columns = set(WEATHER_REALS) if config.weather_enabled else set()
+    selected_weather = config.weather_features()
+    weather_columns = set(selected_weather)
+    weather_columns.update(f"{column}_available" for column in selected_weather)
+    if selected_weather:
+        weather_columns.update(
+            {"weather_available", "weather_issue_timestamp_available", "weather_lead_hours"}
+        )
     required = {
         "site_id",
         "time_idx",
@@ -128,8 +158,8 @@ def prepare_tft_frame(frame: pd.DataFrame, config: TFTTransferConfig) -> pd.Data
             out[column] = pd.to_numeric(out[column], errors="coerce").fillna(
                 config.satellite_missing_value
             )
-    if config.weather_enabled:
-        for column in WEATHER_REALS:
+    if config.weather_features():
+        for column in (*WEATHER_REALS, *WEATHER_MASK_REALS):
             out[column] = pd.to_numeric(out[column], errors="coerce").fillna(0.0)
         # A decoder row is only allowed to use weather issued at or before the
         # sequence issue. Unknown issue metadata is explicitly unavailable.
@@ -137,9 +167,9 @@ def prepare_tft_frame(frame: pd.DataFrame, config: TFTTransferConfig) -> pd.Data
             target_ts = pd.to_datetime(out["timestamp_utc"], utc=True)
             issue_ts = pd.to_datetime(out["weather_forecast_reference_utc"], utc=True)
             unavailable = issue_ts.isna() | (out["weather_issue_timestamp_available"] <= 0)
-            out.loc[unavailable, list(WEATHER_REALS)] = 0.0
+            out.loc[unavailable, list(WEATHER_REALS) + list(WEATHER_MASK_REALS)] = 0.0
             future = issue_ts.notna() & (target_ts <= issue_ts)
-            out.loc[future, list(WEATHER_REALS)] = 0.0
+            out.loc[future, list(WEATHER_REALS) + list(WEATHER_MASK_REALS)] = 0.0
             out.loc[future, "weather_available"] = 0.0
     out["site_id"] = out["site_id"].astype(str)
     return out
@@ -211,8 +241,14 @@ def create_dataset(
         SATELLITE_REALS if config.satellite_enabled and config.satellite_encoder_only else ()
     )
     known_reals = [*KNOWN_REALS, *satellite_known]
-    if config.weather_enabled:
-        known_reals.extend(WEATHER_REALS)
+    if config.weather_features():
+        selected_weather = config.weather_features()
+        known_reals.extend(
+            [*selected_weather, *(f"{column}_available" for column in selected_weather)]
+        )
+        known_reals.extend(
+            ["weather_available", "weather_issue_timestamp_available", "weather_lead_hours"]
+        )
     return TimeSeriesDataSet(
         model_frame,
         time_idx="time_idx",
@@ -241,7 +277,7 @@ def create_dataset(
             "observation_available_real": 0.0,
             "loss_weight": 0.0,
             **{column: config.satellite_missing_value for column in SATELLITE_REALS},
-            **{column: 0.0 for column in WEATHER_REALS},
+            **{column: 0.0 for column in (*WEATHER_REALS, *WEATHER_MASK_REALS)},
         },
         add_relative_time_idx=True,
         add_encoder_length=True,
@@ -479,7 +515,7 @@ def save_model_bundle(
         "features": {
             "known_reals": list(KNOWN_REALS)
             + (list(SATELLITE_REALS) if config.satellite_enabled else [])
-            + (list(WEATHER_REALS) if config.weather_enabled else []),
+            + (list(WEATHER_REALS) if config.weather_features() else []),
             "static_reals": list(STATIC_REALS),
             "targets": list(TARGETS),
             "site_id_is_model_feature": False,
